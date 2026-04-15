@@ -1,9 +1,17 @@
 {
   "name": "ts-forensic-watermark",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Forensic watermarking library in TypeScript with Node.js helpers",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikenokazuki/ts-forensic-watermark.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ikenokazuki/ts-forensic-watermark/issues"
+  },
+  "homepage": "https://github.com/ikenokazuki/ts-forensic-watermark#readme",
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build"

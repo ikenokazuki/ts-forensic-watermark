@@ -1,10 +1,8 @@
 import express from "express";
-import crypto from "crypto";
 import Jimp from "jimp";
 // @ts-ignore
-import { embedForensic, extractForensic, extractVideoForensic } from "../src/forensic";
-// @ts-ignore
-import { createMp4UuidBox } from "../src/utils";
+import {  extractForensic, extractVideoForensic } from "../src/forensic";
+
 
 /**
  * This is an example of how to use the ts-forensic-watermark library

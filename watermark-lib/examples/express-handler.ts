@@ -41,10 +41,10 @@ export const extractWatermarkHandler = async (req: express.Request, res: express
   if (isVideo) {
     result = extractVideoForensic(imageData);
   } else {
-    result = extractForensic(imageData, 120);
+    result = extractForensic(imageData, { delta: 120 });
     
     if (!result || result.payload === 'RECOVERY_FAILED' || result.payload === '') {
-      const fallbackResult = extractForensic(imageData, 60);
+      const fallbackResult = extractForensic(imageData, { delta: 60 });
       if (fallbackResult && fallbackResult.confidence > (result?.confidence || 0)) {
         result = fallbackResult;
       }

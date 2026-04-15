@@ -1,4 +1,4 @@
-import Jimp from 'jimp';
+import { Jimp, JimpMime } from 'jimp';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import fs from 'fs';
@@ -20,7 +20,7 @@ if (ffmpegStatic) {
  * @returns A Promise resolving to the watermarked image buffer (PNG format)
  */
 export async function embedForensicImage(buffer: Buffer, payload: string, options?: ForensicOptions): Promise<Buffer> {
-  const image = await Jimp.read(buffer);
+  const image = await Jimp.fromBuffer(buffer);
   const imageData = {
     data: new Uint8ClampedArray(image.bitmap.data),
     width: image.bitmap.width,
@@ -31,7 +31,7 @@ export async function embedForensicImage(buffer: Buffer, payload: string, option
   
   // Write the modified pixels back to Jimp
   image.bitmap.data = Buffer.from(imageData.data);
-  return await image.getBufferAsync(Jimp.MIME_PNG);
+  return await image.getBuffer(JimpMime.png);
 }
 
 /**
@@ -43,7 +43,7 @@ export async function embedForensicImage(buffer: Buffer, payload: string, option
  * @returns The extraction result or null if failed
  */
 export async function extractForensicImage(buffer: Buffer, options?: ForensicOptions) {
-  const image = await Jimp.read(buffer);
+  const image = await Jimp.fromBuffer(buffer);
   const imageData = {
     data: new Uint8ClampedArray(image.bitmap.data),
     width: image.bitmap.width,

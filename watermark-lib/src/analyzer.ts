@@ -31,14 +31,15 @@ export interface DetectedWatermark {
  */
 export async function generateWatermarkPayloads(
   metadata: { userId: string, sessionId: string, [key: string]: any },
-  secretKey: string
+  secretKey: string,
+  secureIdLength: number = 6
 ) {
   const fullMetadata = {
     ...metadata,
     timestamp: new Date().toISOString()
   };
   const jsonMetadata = await signJsonMetadata(fullMetadata, secretKey, ['userId', 'sessionId']);
-  const securePayload = await generateSecurePayload(metadata.sessionId, secretKey, 6);
+  const securePayload = await generateSecurePayload(metadata.sessionId, secretKey, secureIdLength);
 
   return {
     json: jsonMetadata,
@@ -236,7 +237,11 @@ export function analyzeImageWatermarks(imageData: any, options: ForensicOptions)
  * Runs cryptographic verification over all detected watermarks.
  * Depending on the payload structure (JSON vs Secure String), it applies the correct HMAC checking logic.
  */
-export async function verifyWatermarks(watermarks: DetectedWatermark[], secretKey: string): Promise<DetectedWatermark[]> {
+export async function verifyWatermarks(
+  watermarks: DetectedWatermark[], 
+  secretKey: string,
+  secureIdLength: number = 6
+): Promise<DetectedWatermark[]> {
   const verified: DetectedWatermark[] = [];
 
   for (const wm of watermarks) {
@@ -257,11 +262,11 @@ export async function verifyWatermarks(watermarks: DetectedWatermark[], secretKe
       const payloadString = wm.data.payload || wm.data.sessionId; // Accommodating multiple data structures depending on embed logic
       if (payloadString && payloadString.length === 22) {
         try {
-          const isValid = await verifySecurePayload(payloadString, secretKey, 6);
+          const isValid = await verifySecurePayload(payloadString, secretKey, secureIdLength);
           result.verification = {
             valid: isValid,
             message: isValid 
-              ? `セキュアペイロードの検証に成功しました。（セッションID: ${payloadString.substring(0, 6)}）` 
+              ? `セキュアペイロードの検証に成功しました。（セッションID: ${payloadString.substring(0, secureIdLength)}）` 
               : 'セキュアペイロードの検証に失敗しました。'
           };
         } catch(e) {

@@ -66,14 +66,15 @@ const results = await verifyWatermarks(foundWMs, secretKey);
 
 High-level APIs designed to simplify complex orchestration.
 
-### 1. `generateWatermarkPayloads(metadata, secretKey)`
-Generates all signed payloads required for watermarking in one call.
+### 1. `generateWatermarkPayloads(metadata, secretKey, secureIdLength = 6)`
+Generates all signed payloads required for watermarking.
 - **Arguments**:
   - `metadata`: Object like `{ userId, sessionId, ... }`.
   - `secretKey`: Secret key for HMAC signing.
+  - `secureIdLength`: (Optional) The length of the session ID portion (Total must be 22 bytes with HMAC).
 - **Returns**:
-  - `jsonString`: Signed JSON string for EOF or SEI.
-  - `securePayload`: 22-byte secure string for Forensic/FSK.
+  - `jsonString`: Signed JSON for EOF/SEI.
+  - `securePayload`: Configurable length ID + HMAC (Total 22 bytes).
 
 ### 2. `embedImageWatermarks(imageData, securePayload, options)`
 Writes forensic watermarks into image pixel data.
@@ -142,7 +143,11 @@ Verifies authenticity for all detected watermarks.
 
 ## ⚠️ Important Notes & Limitations
 
-- **Payload Limit**: Forensic and FSK are fixed at **22 bytes** for signal stability and ECC overhead.
+- **Payload Limit & ID Length Trade-off**: 
+  - Forensic and FSK are fixed at **22 bytes** total.
+  - Default is **"6 chars ID + 16 chars HMAC"**. This is configurable via library options.
+  - **Disadvantage (Important)**: Increasing the ID length (e.g., to 10 chars) reduces the HMAC length (e.g., to 12 chars). This reduces the cryptographic security against tampering and increases collision probability. We recommend the default 6-char setting unless strictly necessary.
+  - **Consistency**: You MUST use the same `secureIdLength` for both embedding and verification.
 - **Key Management**: Losing `secretKey` means you can never verify existing watermarks again.
 - **Layered Defense**: We recommend combining Forensic (robust) with EOF/SEI (high capacity) for best results.
 

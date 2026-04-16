@@ -1,11 +1,18 @@
 {
   "name": "ts-forensic-watermark",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "description": "Forensic watermarking library in TypeScript with Node.js helpers",
   "main": "dist/index.js",
+  "browser": "dist/browser.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "browser": "./dist/browser.js",
+      "default": "./dist/index.js"
+    }
+  },
   "engines": {
-    "node": ">=24"
+    "node": ">=20"
   },
   "repository": {
     "type": "git",

@@ -108,60 +108,84 @@ function getSubtleCrypto(): SubtleCrypto {
 }
 
 /**
- * Generates an HMAC-SHA256 hex string for a given message and secret.
- * Uses native Web Crypto API (Zero Dependency).
+ * Returns raw HMAC-SHA256 bytes (32 bytes) for a given message and secret.
+ * Used internally; callers choose their own encoding (hex, Base64url, etc.).
  */
-export async function generateHmacSha256(message: string, secret: string): Promise<string> {
+async function generateHmacBytes(message: string, secret: string): Promise<Uint8Array> {
   const subtle = getSubtleCrypto();
   const encoder = new TextEncoder();
-  const keyData = encoder.encode(secret);
-  const messageData = encoder.encode(message);
-  
   const cryptoKey = await subtle.importKey(
     'raw',
-    keyData,
+    encoder.encode(secret),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign']
   );
-  
-  const signature = await subtle.sign('HMAC', cryptoKey, messageData);
-  return Array.from(new Uint8Array(signature))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+  const signature = await subtle.sign('HMAC', cryptoKey, encoder.encode(message));
+  return new Uint8Array(signature);
+}
+
+/**
+ * Encodes a Uint8Array as a Base64url string (RFC 4648 §5, no padding).
+ * All output characters are ASCII-printable and non-null, making them safe
+ * for embedding in forensic / FSK payloads.
+ */
+function toBase64url(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Generates an HMAC-SHA256 hex string for a given message and secret.
+ * Uses native Web Crypto API (Zero Dependency).
+ */
+export async function generateHmacSha256(message: string, secret: string): Promise<string> {
+  const bytes = await generateHmacBytes(message, secret);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**
  * Generates a 22-byte secure payload (ID + HMAC).
- * Used for highly constrained forensic watermarks.
- * @param id The ID to embed
- * @param secret The secret key for HMAC
- * @param idLength The length of the ID (default: 6). The remaining bytes (22 - idLength) will be used for HMAC.
+ * The HMAC portion is Base64url-encoded, giving 96 bits of entropy for the
+ * default 16-character HMAC slot (vs. 64 bits for the legacy hex format).
+ *
+ * @param id       The ID to embed
+ * @param secret   The secret key for HMAC
+ * @param idLength Chars of `id` to use (default: 6). Remaining (22 - idLength) bytes hold the HMAC.
  */
 export async function generateSecurePayload(id: string, secret: string, idLength: number = 6): Promise<string> {
   const idStr = id.substring(0, idLength).padEnd(idLength, '0');
-  const fullHmac = await generateHmacSha256(idStr, secret);
-  const hmacLength = 22 - idLength;
-  const shortHmac = fullHmac.substring(0, hmacLength);
+  const hmacBytes = await generateHmacBytes(idStr, secret);
+  const shortHmac = toBase64url(hmacBytes).substring(0, 22 - idLength);
   return `${idStr}${shortHmac}`;
 }
 
 /**
  * Verifies a 22-byte secure payload (ID + HMAC).
- * @param payload The 22-byte payload to verify
- * @param secret The secret key for HMAC
+ * Accepts both the current Base64url format and the legacy hex format,
+ * so watermarks embedded with older versions of the library remain valid.
+ *
+ * @param payload  The 22-byte payload to verify
+ * @param secret   The secret key for HMAC
  * @param idLength The length of the ID (default: 6).
  */
 export async function verifySecurePayload(payload: string, secret: string, idLength: number = 6): Promise<boolean> {
   if (payload.length !== 22) return false;
-  
+
   const id = payload.substring(0, idLength);
   const providedHmac = payload.substring(idLength);
-  
-  const fullHmac = await generateHmacSha256(id, secret);
-  const expectedHmac = fullHmac.substring(0, 22 - idLength);
-    
-  return providedHmac === expectedHmac;
+  const hmacLength = 22 - idLength;
+
+  // Compute HMAC bytes once, then derive both encodings for comparison.
+  const hmacBytes = await generateHmacBytes(id, secret);
+
+  // 1. Try current format: Base64url (96-bit strength)
+  if (toBase64url(hmacBytes).substring(0, hmacLength) === providedHmac) return true;
+
+  // 2. Fallback: legacy hex format (64-bit strength) — keeps old watermarks valid
+  const hmacHex = Array.from(hmacBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  return hmacHex.substring(0, hmacLength) === providedHmac;
 }
 
 /**

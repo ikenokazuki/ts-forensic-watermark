@@ -1,6 +1,10 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { Upload, Shield, ShieldAlert, ShieldCheck, FileImage, FileVideo, FileAudio, CheckCircle, AlertTriangle, Key, Download, Settings, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from './lib/utils';
+// ✅ ブラウザ安全なエントリーポイントを使用
+// index.ts は Node.js専用の node.ts（jimp, fs, fluent-ffmpeg）をre-exportするため
+// ブラウザ環境では browser.ts を使う必要があります。
+// browser.ts = forensic + utils + fsk + analyzer のみ（Node.js依存なし）
 import { 
   generateWatermarkPayloads,
   embedImageWatermarks,
@@ -11,7 +15,7 @@ import {
   verifyWatermarks,
   generateFskBuffer,
   ForensicOptions
-} from '../watermark-lib/src/index';
+} from '../watermark-lib/src/browser';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { toBlobURL, fetchFile } from '@ffmpeg/util';
 
@@ -28,6 +32,11 @@ export default function App() {
     force: false,
     robustAngles: [0, 90, 180, 270, 0.5, -0.5, 1, -1]
   });
+  const [fskOptions, setFskOptions] = useState({
+    bitDuration: 0.025,
+    amplitude: 50,
+  });
+  const [secureIdLength, setSecureIdLength] = useState(6);
   const [isRobustDetection, setIsRobustDetection] = useState(true);
 
   return (
@@ -140,7 +149,53 @@ export default function App() {
                 <p className="text-xs text-gray-500 ml-3">分散閾値を無視して真っ白な画像などにも埋め込みます。</p>
               </div>
 
-              <div className="md:col-span-2 pt-2">
+              <div className="md:col-span-2 pt-2 border-t border-gray-100 mt-2">
+                <h3 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">音声・動画 (FSK) & 高度な設定</h3>
+              </div>
+
+              <div>
+                <label className="block text-sm justify-between flex mb-1">
+                  <span className="font-medium text-gray-700">Bit Duration (1ビット長)</span>
+                  <span className="text-gray-500">{fskOptions.bitDuration}s</span>
+                </label>
+                <input 
+                  type="range" min="0.01" max="0.1" step="0.005"
+                  value={fskOptions.bitDuration}
+                  onChange={(e) => setFskOptions({ ...fskOptions, bitDuration: Number(e.target.value) })}
+                  className="w-full"
+                />
+                <p className="text-xs text-gray-500">長いほど堅牢ですが、透かし信号が長くなります。(推奨: 0.025)</p>
+              </div>
+
+              <div>
+                <label className="block text-sm justify-between flex mb-1">
+                  <span className="font-medium text-gray-700">FSK Amplitude (振幅)</span>
+                  <span className="text-gray-500">{fskOptions.amplitude}</span>
+                </label>
+                <input 
+                  type="range" min="10" max="5000" step="10"
+                  value={fskOptions.amplitude}
+                  onChange={(e) => setFskOptions({ ...fskOptions, amplitude: Number(e.target.value) })}
+                  className="w-full"
+                />
+                <p className="text-xs text-gray-500">高いほど検出率が上がりますが、ノイズが聞こえやすくなります。(推奨: 2000)</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Secure ID Length (ID長)</label>
+                <select 
+                  value={secureIdLength}
+                  onChange={(e) => setSecureIdLength(Number(e.target.value))}
+                  className="w-full px-3 py-1.5 border border-gray-300 rounded-md text-sm"
+                >
+                  {[4, 6, 8, 10, 12].map(v => (
+                    <option key={v} value={v}>{v} 文字 (署名: {22 - v} 文字)</option>
+                  ))}
+                </select>
+                <p className="text-xs text-gray-500 mt-1">※署名時と解析時でこの値を一致させる必要があります。</p>
+              </div>
+
+              <div className="pt-6">
                 <div className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-100 rounded-md">
                    <label className="flex items-center gap-2 cursor-pointer">
                     <input 
@@ -167,11 +222,15 @@ export default function App() {
               ...forensicOptions,
               robustAngles: isRobustDetection ? forensicOptions.robustAngles : [0]
             }} 
+            fskOptions={fskOptions}
+            secureIdLength={secureIdLength}
           />
         ) : (
           <SignerTab 
             secretKey={secretKey} 
             options={forensicOptions} 
+            fskOptions={fskOptions}
+            secureIdLength={secureIdLength}
           />
         )}
       </main>
@@ -179,7 +238,7 @@ export default function App() {
   );
 }
 
-function AnalyzerTab({ secretKey, options }: { secretKey: string, options: ForensicOptions }) {
+function AnalyzerTab({ secretKey, options, fskOptions, secureIdLength }: { secretKey: string, options: ForensicOptions, fskOptions: any, secureIdLength: number }) {
   const [file, setFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [results, setResults] = useState<any[]>([]);
@@ -238,7 +297,10 @@ function AnalyzerTab({ secretKey, options }: { secretKey: string, options: Foren
           const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
           const channelData = audioBuffer.getChannelData(0);
           
-          const audioWMs = analyzeAudioWatermarks(channelData, { sampleRate: audioBuffer.sampleRate });
+          const audioWMs = analyzeAudioWatermarks(channelData, { 
+            sampleRate: audioBuffer.sampleRate,
+            ...fskOptions
+          });
           foundWatermarks = [...foundWatermarks, ...audioWMs];
         } catch (e) {
           console.warn("Audio processing failed", e);
@@ -246,7 +308,7 @@ function AnalyzerTab({ secretKey, options }: { secretKey: string, options: Foren
       }
 
       // 4. すべての透かしをライブラリで一括検証（HMAC署名チェック等）
-      const verifiedResults = await verifyWatermarks(foundWatermarks, secretKey);
+      const verifiedResults = await verifyWatermarks(foundWatermarks, secretKey, secureIdLength);
 
       if (verifiedResults.length === 0) {
         setError("電子透かしを検出できませんでした。ファイルが改ざんされているか、透かしが含まれていません。");
@@ -351,7 +413,7 @@ function AnalyzerTab({ secretKey, options }: { secretKey: string, options: Foren
   );
 }
 
-function SignerTab({ secretKey, options }: { secretKey: string, options: ForensicOptions }) {
+function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretKey: string, options: ForensicOptions, fskOptions: any, secureIdLength: number }) {
   const [userId, setUserId] = useState('user_12345');
   const [sessionId, setSessionId] = useState('sess_abcde');
   const [prizeId, setPrizeId] = useState('prize_001');
@@ -388,7 +450,7 @@ function SignerTab({ secretKey, options }: { secretKey: string, options: Forensi
   };
 
   const handleGenerate = async () => {
-    const payloads = await generateWatermarkPayloads({ userId, sessionId, prizeId }, secretKey);
+    const payloads = await generateWatermarkPayloads({ userId, sessionId, prizeId }, secretKey, secureIdLength);
     setSignedJson(payloads.jsonString);
     setSecurePayload(payloads.securePayload);
   };
@@ -408,7 +470,7 @@ function SignerTab({ secretKey, options }: { secretKey: string, options: Forensi
         
         // 1. Generate FSK Buffer in memory
         setProgressMsg('FSK 音声ストリームを生成中...');
-        const fskWavBuffer = generateFskBuffer(securePayload);
+        const fskWavBuffer = generateFskBuffer(securePayload, fskOptions);
         
         // 2. Load files into ffmpeg virtual FS
         setProgressMsg('メディアをメモリに読み込み中...');
@@ -428,10 +490,10 @@ function SignerTab({ secretKey, options }: { secretKey: string, options: Forensi
           // Video processing
           if (isSilentVideo) {
             // Add as standard track
-            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-shortest', outputName]);
+            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', outputName]);
           } else {
             // Mix with existing audio
-            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', outputName]);
+            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', outputName]);
           }
         }
         

@@ -29,7 +29,12 @@ export function generateFskBuffer(payload: string, options?: FskOptions): Uint8A
   const bitDuration = options?.bitDuration || 0.025; // 高速版 25ms
   const syncDuration = options?.syncDuration || 0.05; // 同期音 50ms
   const marginDuration = options?.marginDuration || 0.1; // ガードインターバル
-  const amplitude = options?.amplitude || 2000; 
+  const amplitude = options?.amplitude || 50;
+  // 14/15/16 kHz: inaudible to most humans yet preserved by AAC at 192 kb/s+.
+  // 17/18/19 kHz was destroyed by AAC's psychoacoustic model at the default ~69 kb/s.
+  const freqSync = options?.freqSync ?? 14000;
+  const freqZero = options?.freqZero ?? 15000;
+  const freqOne  = options?.freqOne  ?? 16000;
   
   const samplesPerBit = Math.floor(sampleRate * bitDuration);
   const syncSamples = Math.floor(sampleRate * syncDuration);
@@ -68,11 +73,11 @@ export function generateFskBuffer(payload: string, options?: FskOptions): Uint8A
 
   let phase = 0; // 位相を保持する変数を追加
 
-  // 1. 同期音 (17000Hz)
+  // 1. 同期音
   for (let i = 0; i < syncSamples; i++) {
     const val = Math.sin(phase) * amplitude;
     dataView.setInt16(44 + i * 2, Math.floor(val), true);
-    phase += 2 * Math.PI * 17000 / sampleRate; // 次の位相を計算
+    phase += 2 * Math.PI * freqSync / sampleRate;
   }
 
   // 2. ★ 隙間 (0.1秒間、0を書き込む)
@@ -80,18 +85,18 @@ export function generateFskBuffer(payload: string, options?: FskOptions): Uint8A
     dataView.setInt16(44 + (syncSamples + i) * 2, 0, true);
   }
 
-  // 3. データビット (18000Hz or 19000Hz)
+  // 3. データビット (freqZero or freqOne)
   let currentPos = syncSamples + marginSamples;
   for (let i = 0; i < 240; i++) {
     const byteIdx = Math.floor(i / 8);
     const bitIdx = i % 8;
     const bit = (interleaved[byteIdx] >> (7 - bitIdx)) & 1;
-    const freq = bit === 1 ? 19000 : 18000;
-    
+    const freq = bit === 1 ? freqOne : freqZero;
+
     for (let s = 0; s < samplesPerBit; s++) {
       const val = Math.sin(2 * Math.PI * freq * s / sampleRate) * amplitude;
       dataView.setInt16(44 + (currentPos + s) * 2, Math.floor(val), true);
-      phase += 2 * Math.PI * freq / sampleRate; // ★ここが重要：周波数が変わっても波を繋げる
+      phase += 2 * Math.PI * freq / sampleRate;
     }
     currentPos += samplesPerBit;
   }
@@ -108,9 +113,9 @@ export function extractFskBuffer(channelData: Float32Array, options?: FskOptions
   const bitDuration = options?.bitDuration || 0.025; 
   const syncDuration = options?.syncDuration || 0.05; 
   const marginDuration = options?.marginDuration || 0.1;
-  const freqZero = options?.freqZero || 18000;
-  const freqOne = options?.freqOne || 19000;
-  const freqSync = options?.freqSync || 17000;
+  const freqZero = options?.freqZero ?? 15000;
+  const freqOne  = options?.freqOne  ?? 16000;
+  const freqSync = options?.freqSync ?? 14000;
 
   function goertzel(data: Float32Array | Array<number>, freq: number, sampleRate: number) {
     const k = Math.round(0.5 + (data.length * freq) / sampleRate);
@@ -135,9 +140,9 @@ export function extractFskBuffer(channelData: Float32Array, options?: FskOptions
   // 1. Search for sync signal (17kHz)
   for (let i = 0; i < Math.min(channelData.length - syncWindow, sampleRate * 5); i += stepSamples) {
     const windowData = channelData.slice(i, i + syncWindow);
-    const magSync = goertzel(windowData, 17000, sampleRate);
-    const mag0 = goertzel(windowData, 18000, sampleRate);
-    const mag1 = goertzel(windowData, 19000, sampleRate);
+    const magSync = goertzel(windowData, freqSync, sampleRate);
+    const mag0 = goertzel(windowData, freqZero, sampleRate);
+    const mag1 = goertzel(windowData, freqOne,  sampleRate);
     
     if (magSync > maxSyncMag) maxSyncMag = magSync;
 
@@ -158,7 +163,7 @@ export function extractFskBuffer(channelData: Float32Array, options?: FskOptions
     let finalPayload: string | null = null;
     const rsDec = new ReedSolomon(8);
 
-    console.log("=== 超堅牢スキャニング・デコード開始 ===");
+    console.log("=== 堅牢スキャニング・デコード開始 ===");
 
     outerLoop: for (const tShift of timeShifts) {
       const marginMs = 100;
@@ -172,8 +177,8 @@ export function extractFskBuffer(channelData: Float32Array, options?: FskOptions
         const offset = Math.floor(samplesPerBit * 0.25);
         const windowData = channelData.slice(i + offset, i + offset + windowSize);
         
-        const mag0 = goertzel(windowData, 18000, sampleRate);
-        const mag1 = goertzel(windowData, 19000, sampleRate);
+        const mag0 = goertzel(windowData, freqZero, sampleRate);
+        const mag1 = goertzel(windowData, freqOne,  sampleRate);
         rawBits.push(mag1 > mag0 ? 1 : 0);
       }
 

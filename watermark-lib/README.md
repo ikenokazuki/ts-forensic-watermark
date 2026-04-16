@@ -1,208 +1,164 @@
 # ts-forensic-watermark
 
-A forensic watermarking (steganography) library in TypeScript.
+A secure, isomorphic (environment-agnostic) forensic watermarking library in TypeScript.
+Supports embedding robust and tamper-resistant watermarks into **images**, **videos**, and **audio**.
 
-While the core mathematical logic is pure TypeScript and environment-agnostic, **this library includes convenient Node.js helpers powered by `jimp` and `fluent-ffmpeg`**. This "batteries-included" approach allows you to process image buffers and video files directly with a single function call.
+## 💡 Architecture Philosophy: Library-First
 
-## Installation
-
-```bash
-npm install ts-forensic-watermark
-```
-*(Note: `jimp`, `fluent-ffmpeg`, and `ffmpeg-static` are installed automatically. Because static FFmpeg binaries are included, **you do NOT need to install FFmpeg on your OS**—video processing works out of the box).*
-
-## Usage (Node.js Helpers)
-
-### 1. Image Watermarking (Powered by Jimp)
-
-Simply pass a raw image `Buffer`. The library handles decoding, embedding, and re-encoding automatically.
-
-```typescript
-import { embedForensicImage, extractForensicImage } from 'ts-forensic-watermark';
-import fs from 'fs';
-
-async function processImage() {
-  // --- Embed ---
-  const inputBuffer = fs.readFileSync('input.jpg');
-  const payload = "SECURE123";
-  
-  // Returns a new PNG buffer with the watermark embedded
-  const watermarkedBuffer = await embedForensicImage(inputBuffer, payload);
-  fs.writeFileSync('output.png', watermarkedBuffer);
-
-  // --- Extract ---
-  const result = await extractForensicImage(watermarkedBuffer);
-  if (result && result.payload !== 'RECOVERY_FAILED') {
-    console.log('Extracted Payload:', result.payload); // "SECURE123"
-    console.log('Confidence Score:', result.confidence);
-  }
-}
-```
-
-### 2. Video Watermarking (Powered by FFmpeg)
-
-Injects both **H.264 SEI** metadata and an **MP4 UUID Box** into a video file in one go. It uses stream copying (`-c:v copy`), so it is extremely fast and does not degrade video quality.
-
-```typescript
-import { embedVideoWatermark } from 'ts-forensic-watermark';
-
-async function processVideo() {
-  const inputPath = 'input.mp4';
-  const outputPath = 'output_watermarked.mp4';
-  const payload = JSON.stringify({ userId: "user_001", orderId: "ord_999" });
-
-  // Pass file paths, and it handles the FFmpeg process automatically
-  await embedVideoWatermark(inputPath, outputPath, payload);
-  console.log('Video watermarking complete!');
-}
-```
-
-### 3. HMAC-SHA256 Signatures (Tamper Detection)
-
-The library includes utilities to cryptographically sign your payloads, ensuring they haven't been tampered with. It uses the native Web Crypto API, so it works in Node.js, browsers, and edge environments without relying on Node's `crypto` module.
-
-```typescript
-import { 
-  generateSecurePayload, verifySecurePayload, 
-  signJsonMetadata, verifyJsonSignature 
-} from 'ts-forensic-watermark';
-
-const SECRET_KEY = "my-super-secret-key";
-
-async function testSignatures() {
-  // 1. Generate a 22-byte secure payload for forensic watermarking (6-char ID + 16-char HMAC)
-  const securePayload = await generateSecurePayload("ORD123", SECRET_KEY);
-  
-  const isValid = await verifySecurePayload(securePayload, SECRET_KEY);
-  console.log("Payload Valid:", isValid); // true
-
-  // 2. Sign JSON metadata for EOE or UUID Boxes
-  const metadata = { userId: "user_01", sessionId: "sess_99", timestamp: "2023-10-01T12:00:00Z" };
-  
-  // Generates a signature over specific fields and appends it to the object
-  const signedMetadata = await signJsonMetadata(metadata, SECRET_KEY, ['userId', 'sessionId']);
-  
-  const isJsonValid = await verifyJsonSignature(signedMetadata, SECRET_KEY, ['userId', 'sessionId']);
-  console.log("JSON Signature Valid:", isJsonValid); // true
-}
-```
-
-### 4. Tuning Options & Custom ID Length
-
-You can fine-tune the robustness and visual impact of the watermark using `ForensicOptions`.
-
-```typescript
-import { embedForensicImage, extractForensicImage } from 'ts-forensic-watermark';
-
-const options = {
-  delta: 120,              // Embedding depth (default: 120). Higher = more robust to compression, but more noise.
-  varianceThreshold: 25,   // Embedding area (default: 25). Lower = embeds in flatter areas, but noise becomes more visible.
-  arnoldIterations: 7      // Spatial scrambling strength (default: 7). Must match during extraction.
-};
-
-// Embed
-const watermarkedBuffer = await embedForensicImage(imageBuffer, 'MyPayload', options);
-
-// Extract
-const result = await extractForensicImage(watermarkedBuffer, options);
-```
-
-You can also customize the ID length of the secure payload (default is 22 bytes total).
-
-```typescript
-import { generateSecurePayload, verifySecurePayload } from 'ts-forensic-watermark';
-
-// 10-char ID + 12-char HMAC signature (Total: 22 bytes)
-const payload = await generateSecurePayload('USER123456', 'my-secret', 10);
-const isValid = await verifySecurePayload(payload, 'my-secret', 10);
-```
-
-### 5. Web UI Demo
-
-The root directory of this project includes a **Web UI Demo (React + Vite)** that demonstrates how to use this library entirely in the browser. It is a complete implementation that performs watermark generation, embedding, extraction, and signature verification using only local browser APIs (Web Crypto API and Canvas API) without any backend server.
-
-**How to run:**
-```bash
-# Run in the project root directory
-npm install
-npm run dev
-```
-
-**Features:**
-1. **Sign & Embed Tab**: 
-   Enter metadata (like User ID and Session ID), select an image, and the app will embed both a "Forensic Watermark" (invisible) and "EOF Metadata" (signed JSON) into the image, ready for download.
-2. **Analyze Tab**: 
-   Drag and drop a watermarked image to automatically extract the watermark data and verify its authenticity (tamper detection) using HMAC signatures.
+This project encapsulates all business logic (watermark generation, signing, extraction, and verification) within the core library. The library handles high-level functions that work identically across browsers, Node.js servers, and CLI tools using a pure isomorphic design.
 
 ---
 
-## Core API (Browser / Edge Environments)
+## 🚀 Key Features
 
-If you are running in a browser or Edge environment (like Cloudflare Workers), you can bypass the Node.js helpers and use the pure core functions directly on pixel data.
+- **[Image] Frequency-Domain Forensic Watermarking**: Invisible watermarking resilient to lossy compression (JPEG, etc.) via DWT + DCT + SVD.
+- **[Video/Audio] FSK Acoustic Watermarking**: High-frequency watermarking (17kHz–19kHz) using FSK (Frequency-Shift Keying). Resilient to "Analog Hole" (re-recording) attacks.
+- **[Cross-Platform] Metadata Signing (HMAC-SHA256)**: Mathematically proves that watermark data has not been tampered with.
+- **[Cross-Platform] Self-Healing (ECC)**: Implements Reed-Solomon Error Correction to restore corrupted payloads.
+
+---
+
+## 📖 Beginner's Guide: Embedding & Verification Flow
+
+### Step 1: Generating Signatures and Payloads (Signing)
+
+Generate all necessary payloads (JSON for EOF, secure string for Forensic/FSK) in one go.
+
+> [!IMPORTANT]
+> **⚠️ The 22-Byte Constraint**
+> For maximum robustness and error correction, Forensic and FSK watermarks have a fixed payload capacity of **22 bytes**.
+> We generate a **"6-character Session ID" + "16-character HMAC signature"** set to ensure tamper detection even with short data.
+
+### Step 2: Embedding into Media (Pipeline)
+
+Burn the generated data into your media. For images, a dual-layer approach is recommended.
+
+#### 【For Images】
+Apply both invisible pixel-level embedding and file-end metadata appending.
 
 ```typescript
-import { embedForensic, extractForensic } from 'ts-forensic-watermark';
+import { embedImageWatermarks, finalizeImageBuffer } from 'ts-forensic-watermark';
 
-// Use Canvas API or any other decoder to get raw RGBA pixels
-const imageData = {
-  data: new Uint8ClampedArray([...]), // RGBA array
-  width: 1920,
-  height: 1080
-};
+// 1. [Pixel Level] Modifies Canvas ImageData directly
+embedImageWatermarks(imageData, payloads.securePayload);
 
-embedForensic(imageData, "SECURE123");
+// 2. [Binary Level] Append to file buffer after converting Canvas to Blob/Buffer
+const finalBuffer = finalizeImageBuffer(originalBuffer, payloads.jsonString);
+```
+
+### Step 3: Analysis and Verification (Verification)
+
+Extract data from a file and verify its authenticity using your secret key.
+
+```typescript
+import { analyzeTextWatermarks, verifyWatermarks } from 'ts-forensic-watermark';
+
+// 1. Scan for watermarks (Auto-detection)
+const foundWMs = analyzeTextWatermarks(fileUint8Array);
+
+// 2. Verify all signatures in batch
+const results = await verifyWatermarks(foundWMs, secretKey);
 ```
 
 ---
 
-## Watermarking Techniques: Background, Pros, and Cons
+## 🔀 Pipeline Function Reference
 
-This library provides multiple watermarking techniques tailored for different use cases.
+High-level APIs designed to simplify complex orchestration.
+
+### 1. `generateWatermarkPayloads(metadata, secretKey)`
+Generates all signed payloads required for watermarking in one call.
+- **Arguments**:
+  - `metadata`: Object like `{ userId, sessionId, ... }`.
+  - `secretKey`: Secret key for HMAC signing.
+- **Returns**:
+  - `jsonString`: Signed JSON string for EOF or SEI.
+  - `securePayload`: 22-byte secure string for Forensic/FSK.
+
+### 2. `embedImageWatermarks(imageData, securePayload, options)`
+Writes forensic watermarks into image pixel data.
+- **Role**: Directly mutates the `ImageData` object to embed invisible watermarks.
+
+### 3. `finalizeImageBuffer(buffer, jsonMetadata)`
+Appends metadata to the file binary.
+- **Role**: Appends signed JSON metadata to a `Uint8Array` (image buffer) and returns the finalized file buffer.
+
+### 4. `verifyWatermarks(watermarks, secretKey)`
+Verifies authenticity for all detected watermarks.
+- **Role**: Automatically detects signature types and performs HMAC verification. Returns an array of results with `valid` status and messages.
+
+---
+
+## ⚙️ Detailed Parameter Reference
+
+### 1. Advanced Forensic Watermarking (`ForensicOptions`)
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `delta` | number | `120` | Embedding intensity. Higher = more robust but more digital noise. |
+| `varianceThreshold` | number | `25` | Texture threshold. Lower = embeds in smoother areas. |
+| `arnoldIterations` | number | `7` | Scrambling iterations. Must match during extraction. |
+| `force` | boolean | `false` | Ignores texture checks and forces embedding. |
+| `robustAngles` | number[] | `[0]` | **[NEW]** List of angles to try during extraction. e.g., `[0, 90, 180, 270, 0.5, -0.5]`. Enables detection even if the image is rotated or slightly tilted. |
+
+> [!TIP]
+> **Rotation Robustness (Multi-angle Scan)**
+> The library dynamically rotates the image during analysis based on the provided angle list. 90/180/270-degree rotations are performed via fast index transpositions, while fine-grained tilts (e.g., 0.5°) use high-precision **Bilinear Interpolation** to preserve watermark signal integrity.
+
+### 2. FSK Acoustic Watermarking (`FskOptions`)
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `amplitude` | number | `2000` | Signal volume. Use 2000-5000 for robustness against AAC compression. |
+| `sampleRate` | number | `44100` | Sampling rate in Hz. |
+| `bitDuration` | number | `0.025` | Duration per bit in seconds. |
+| `freqZero` | number | `18000` | Frequency for bit "0" (Hz). |
+| `freqOne` | number | `19000` | Frequency for bit "1" (Hz). |
+| `freqSync` | number | `17000` | Frequency for sync pulse (Hz). |
+
+---
+
+## 📚 Technical Comparison: Pros and Cons
 
 ### 1. Advanced Forensic Watermarking (DWT + DCT + SVD)
-* **Technical Background**: A sophisticated steganography technique that embeds data into the frequency domain of an image. It uses Discrete Wavelet Transform (DWT) to separate frequency bands, Discrete Cosine Transform (DCT), and Singular Value Decomposition (SVD) to embed data into the singular values. It also utilizes Arnold Transform for spatial scrambling and Reed-Solomon Error Correction Codes (ECC) to ensure data integrity.
-* **Pros**:
-  * **Extreme Robustness**: Highly resilient against JPEG compression, resizing, cropping, and noise addition.
-  * **Invisibility**: The watermark is perceptually invisible to the human eye.
-* **Cons**:
-  * **High Computation Cost**: The complex mathematical transformations require significant CPU resources and processing time.
-  * **Limited Payload**: Can only store a very small amount of data (e.g., ~22 bytes), making it suitable only for short IDs or hashes.
+* **Technical Details**: Uses **YCrCb** color space, **DWT** to decompose into frequency bands, and **8x8 Block-based DCT** and **SVD** on the LH band. Scrambled via **Arnold Transform**.
+* **Pros**: Extreme resistance to JPEG compression, resizing, and noise.
+* **Cons**: Computationally heavy for huge images.
 
-### 2. EOE (End Of File) Watermarking
-* **Technical Background**: Appends raw text or binary data directly to the end of a file buffer (after the official EOF marker). Most media decoders (for PNG, JPEG, MP3) ignore any trailing data after the EOF marker, allowing the file to be read normally.
-* **Pros**:
-  * **Zero Degradation & High Speed**: Does not affect media quality at all and executes almost instantly.
-  * **Large Payload**: Can easily store large amounts of data, such as JSON metadata or full cryptographic signatures.
-* **Cons**:
-  * **Fragility**: Easily destroyed. Any re-encoding, resizing, or saving via an image editor will strip the appended data.
-  * **Low Secrecy**: The appended data can be easily discovered and removed using a simple hex editor.
+### 2. FSK Acoustic Watermarking
+* **Technical Details**: Uses **FSK** modulation. Extraction via **FFT** analysis. Protected by **Reed-Solomon ECC (22+8 parity)** for high reliability.
+* **Pros**: Survives the "Analog Hole" (mic recording). Inaudible to humans.
+* **Cons**: Vulnerable to 16kHz low-pass filters used by some platforms.
 
-### 3. MP4 UUID Box
-* **Technical Background**: Injects a custom `uuid` extension box into the ISO Base Media File Format (ISOBMFF / MP4) container structure, which is the standard way to add custom metadata to MP4 files.
-* **Pros**:
-  * **Standard Compliant**: Safely adds metadata without degrading video or audio quality, adhering to MP4 specifications.
-* **Cons**:
-  * **Vulnerable to Transcoding**: Like EOE, custom UUID boxes are typically stripped when the video is uploaded to social media platforms or processed by transcoders.
+### 3. EOE (End Of File) Metadata
+* **Technical Details**: Appends signed data after the EOF marker.
+* **Pros**: Instant, zero quality loss, high capacity.
+* **Cons**: Extremely fragile; removed by most editors.
 
-### 4. H.264 SEI (Supplemental Enhancement Information)
-* **Technical Background**: Embeds metadata directly into the H.264/H.265 video bitstream via NAL units. This library generates the `user_data_unregistered` payload string.
-* **Pros**:
-  * **Stream-level Binding**: Because it's embedded in the video stream rather than the container, it survives container format changes (e.g., MP4 to MKV) and stream copying.
-* **Cons**:
-  * **Vulnerable to Transcoding**: Usually stripped when platforms re-encode the video.
-  * **Requires External Tools**: Injecting the payload into the actual video file requires a multiplexer like FFmpeg.
+### 4. H.264 SEI / MP4 UUID Box
+* **Technical Details**: Injects metadata into H.264 bitstreams or MP4 containers.
+* **Pros**: Standard compliant.
+* **Cons**: Typically stripped during transcoding on video platforms.
 
 ---
 
-## Future Roadmap
+## ⚠️ Important Notes & Limitations
 
-### FSK Watermarking for Audio and Video
-As a future update, we plan to implement **Audio Watermarking using FSK (Frequency-Shift Keying)** for standalone audio files and video audio tracks.
-
-This upcoming feature will allow for extremely robust forensic tracking in audio. FSK watermarks are designed to survive analog "analog hole" conversions, meaning the watermark can still be extracted even if the audio is played through a speaker and re-recorded with a microphone.
+- **Payload Limit**: Forensic and FSK are fixed at **22 bytes** for signal stability and ECC overhead.
+- **Key Management**: Losing `secretKey` means you can never verify existing watermarks again.
+- **Layered Defense**: We recommend combining Forensic (robust) with EOF/SEI (high capacity) for best results.
 
 ---
 
-## Integrating with Node.js (Jimp)
+## 🏗 Architecture
 
-Since this library is dependency-free, you can easily plug it into your existing Node.js stack. See the `examples/` folder for an Express.js + Jimp integration example.
+```mermaid
+graph TD
+    UI[Web UI / CLI / Server] -->|Call| Manager[analyzer.ts / manager]
+    Manager -->|Analyze| Core[Core Logic]
+    Manager -->|Verify| Crypto[Web Crypto API]
+    Core -->|Image| DWT[DWT+DCT+SVD]
+    Core -->|Audio| FSK[FSK Generator/Extractor]
+    Core -->|ECC| RS[Reed-Solomon ECC]
+```
+
+## License
+MIT License

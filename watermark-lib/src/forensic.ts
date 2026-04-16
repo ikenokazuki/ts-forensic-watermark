@@ -16,6 +16,8 @@ export interface ForensicOptions {
   arnoldIterations?: number;
   /** 強制埋め込み/抽出フラグ (分散やSVDの閾値を無視します) */
   force?: boolean;
+  /** 回転耐性向上のために抽出時に試行する角度リスト (例: [0, 90, 180, 270, 0.5, -0.5]) */
+  robustAngles?: number[];
 }
 
 // ==========================================

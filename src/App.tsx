@@ -1,21 +1,34 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { Upload, Shield, ShieldAlert, ShieldCheck, FileImage, FileVideo, FileAudio, CheckCircle, AlertTriangle, Key, Download } from 'lucide-react';
+import { Upload, Shield, ShieldAlert, ShieldCheck, FileImage, FileVideo, FileAudio, CheckCircle, AlertTriangle, Key, Download, Settings, ChevronDown, ChevronUp } from 'lucide-react';
 import { cn } from './lib/utils';
 import { 
-  appendEofWatermark, 
-  extractEofWatermark, 
-  signJsonMetadata, 
-  verifyJsonSignature,
-  generateSecurePayload,
-  verifySecurePayload
-} from '../watermark-lib/src/utils';
-import { embedForensic, extractForensic } from '../watermark-lib/src/forensic';
+  generateWatermarkPayloads,
+  embedImageWatermarks,
+  finalizeImageBuffer,
+  analyzeTextWatermarks,
+  analyzeAudioWatermarks,
+  analyzeImageWatermarks,
+  verifyWatermarks,
+  generateFskBuffer,
+  ForensicOptions
+} from '../watermark-lib/src/index';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { toBlobURL, fetchFile } from '@ffmpeg/util';
 
 type Tab = 'analyze' | 'sign';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('analyze');
   const [secretKey, setSecretKey] = useState('my-super-secret-key');
+  const [showSettings, setShowSettings] = useState(false);
+  const [forensicOptions, setForensicOptions] = useState<ForensicOptions>({
+    delta: 120,
+    varianceThreshold: 25,
+    arnoldIterations: 7,
+    force: false,
+    robustAngles: [0, 90, 180, 270, 0.5, -0.5, 1, -1]
+  });
+  const [isRobustDetection, setIsRobustDetection] = useState(true);
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
@@ -48,26 +61,125 @@ export default function App() {
           </button>
         </div>
 
-        <div className="mb-6 bg-white p-4 rounded-lg border border-gray-200 shadow-sm flex items-center gap-4">
-          <Key className="w-5 h-5 text-gray-400" />
-          <div className="flex-1">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Secret Key (検証・署名用)</label>
-            <input 
-              type="text" 
-              value={secretKey}
-              onChange={(e) => setSecretKey(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
+        <div className="mb-6 bg-white p-4 rounded-lg border border-gray-200 shadow-sm flex flex-col gap-4">
+          <div className="flex items-center gap-4">
+            <Key className="w-5 h-5 text-gray-400" />
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-gray-700 mb-1">Secret Key (検証・署名用共通キー)</label>
+              <input 
+                type="text" 
+                value={secretKey}
+                onChange={(e) => setSecretKey(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className="mt-6 flex items-center gap-2 px-3 py-2 border border-blue-200 text-blue-700 bg-blue-50 rounded-md hover:bg-blue-100 transition-colors whitespace-nowrap"
+            >
+              <Settings className="w-4 h-4" />
+              透かし詳細設定
+              {showSettings ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </button>
           </div>
+
+          {showSettings && (
+            <div className="pt-4 border-t border-gray-200 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+              <div>
+                <label className="block text-sm justify-between flex mb-1">
+                  <span className="font-medium text-gray-700">Delta (彫りの深さ)</span>
+                  <span className="text-gray-500">{forensicOptions.delta}</span>
+                </label>
+                <input 
+                  type="range" min="10" max="255" step="10"
+                  value={forensicOptions.delta}
+                  onChange={(e) => setForensicOptions({ ...forensicOptions, delta: Number(e.target.value) })}
+                  className="w-full"
+                />
+                <p className="text-xs text-gray-500">高くすると圧縮耐性が上がりますが、ノイズが目立ちます。(推奨: 120)</p>
+              </div>
+              
+              <div>
+                <label className="block text-sm justify-between flex mb-1">
+                  <span className="font-medium text-gray-700">Variance Threshold (分散閾値)</span>
+                  <span className="text-gray-500">{forensicOptions.varianceThreshold}</span>
+                </label>
+                <input 
+                  type="range" min="0" max="100" step="5"
+                  value={forensicOptions.varianceThreshold}
+                  onChange={(e) => setForensicOptions({ ...forensicOptions, varianceThreshold: Number(e.target.value) })}
+                  className="w-full"
+                />
+                <p className="text-xs text-gray-500">平坦な部分（青空など）への埋め込みを避ける閾値です。(推奨: 25)</p>
+              </div>
+
+              <div>
+                <label className="block text-sm justify-between flex mb-1">
+                  <span className="font-medium text-gray-700">Arnold Iterations (スクランブル強度)</span>
+                  <span className="text-gray-500">{forensicOptions.arnoldIterations}</span>
+                </label>
+                <input 
+                  type="range" min="1" max="20" step="1"
+                  value={forensicOptions.arnoldIterations}
+                  onChange={(e) => setForensicOptions({ ...forensicOptions, arnoldIterations: Number(e.target.value) })}
+                  className="w-full"
+                />
+                <p className="text-xs text-gray-500">空間スプレッドの反復回数です。(推奨: 7)</p>
+              </div>
+
+              <div className="flex items-center pt-6">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input 
+                    type="checkbox"
+                    checked={forensicOptions.force}
+                    onChange={(e) => setForensicOptions({ ...forensicOptions, force: e.target.checked })}
+                    className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                  />
+                  <span className="text-sm font-medium text-gray-700">Force (強制埋め込み)</span>
+                </label>
+                <p className="text-xs text-gray-500 ml-3">分散閾値を無視して真っ白な画像などにも埋め込みます。</p>
+              </div>
+
+              <div className="md:col-span-2 pt-2">
+                <div className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-100 rounded-md">
+                   <label className="flex items-center gap-2 cursor-pointer">
+                    <input 
+                      type="checkbox"
+                      checked={isRobustDetection}
+                      onChange={(e) => setIsRobustDetection(e.target.checked)}
+                      className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                    />
+                    <span className="text-xs text-gray-700 font-medium">画像回転耐性を有効にする (低速)</span>
+                  </label>
+                  <p className="text-[10px] text-gray-500 pl-6">
+                    画像を 90/180/270度、および ±0.5/1度回転させてスキャンします。傾いた写真でも検出可能です。
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
-        {activeTab === 'analyze' ? <AnalyzerTab secretKey={secretKey} /> : <SignerTab secretKey={secretKey} />}
+        {activeTab === 'analyze' ? (
+          <AnalyzerTab 
+            secretKey={secretKey} 
+            options={{
+              ...forensicOptions,
+              robustAngles: isRobustDetection ? forensicOptions.robustAngles : [0]
+            }} 
+          />
+        ) : (
+          <SignerTab 
+            secretKey={secretKey} 
+            options={forensicOptions} 
+          />
+        )}
       </main>
     </div>
   );
 }
 
-function AnalyzerTab({ secretKey }: { secretKey: string }) {
+function AnalyzerTab({ secretKey, options }: { secretKey: string, options: ForensicOptions }) {
   const [file, setFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [results, setResults] = useState<any[]>([]);
@@ -83,32 +195,15 @@ function AnalyzerTab({ secretKey }: { secretKey: string }) {
     setError(null);
 
     try {
-      const buffer = await selectedFile.arrayBuffer();
-      const uint8Array = new Uint8Array(buffer);
-      const foundWatermarks = [];
+      const arrayBuffer = await selectedFile.arrayBuffer();
+      const uint8Array = new Uint8Array(arrayBuffer);
+      let foundWatermarks: any[] = [];
 
-      // 1. EOE Watermark Extraction
-      try {
-        const eofDataStr = extractEofWatermark(uint8Array);
-        if (eofDataStr) {
-          const data = JSON.parse(eofDataStr);
-          const isValid = await verifyJsonSignature(data, secretKey, ['userId', 'sessionId']);
-          foundWatermarks.push({
-            type: 'EOF',
-            name: 'EOFメタデータ (ファイル末尾)',
-            robustness: 'Low (脆弱)',
-            data,
-            verification: {
-              valid: isValid,
-              message: isValid ? 'HMAC署名の検証に成功しました。データは真正です。' : 'HMAC署名が一致しません。改ざんの可能性があります。'
-            }
-          });
-        }
-      } catch (err) {
-        console.warn("EOF extraction failed", err);
-      }
+      // 1. 文字列ベースの透かし（EOF, UUID, SEI）をライブラリで一括解析
+      const textWMs = analyzeTextWatermarks(uint8Array);
+      foundWatermarks = [...foundWatermarks, ...textWMs];
 
-      // 2. Forensic Image Watermark Extraction (if image)
+      // 2. 画像フォレンジック透かし（画像の場合）
       if (selectedFile.type.startsWith('image/')) {
         try {
           const img = new Image();
@@ -125,44 +220,38 @@ function AnalyzerTab({ secretKey }: { secretKey: string }) {
           if (ctx) {
             ctx.drawImage(img, 0, 0);
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            
-            // Try extracting with different deltas
-            let forensicResult = extractForensic(imageData, { delta: 120 });
-            if (!forensicResult || forensicResult.payload === 'RECOVERY_FAILED') {
-              forensicResult = extractForensic(imageData, { delta: 60 });
-            }
-
-            if (forensicResult && forensicResult.payload !== 'RECOVERY_FAILED' && forensicResult.payload.length > 0) {
-              // Check if it's a 22-byte secure payload
-              let isValid = false;
-              let message = '署名なしのペイロードです。';
-              
-              if (forensicResult.payload.length === 22) {
-                isValid = await verifySecurePayload(forensicResult.payload, secretKey, 6);
-                message = isValid ? 'セキュアペイロードの検証に成功しました。' : 'セキュアペイロードの検証に失敗しました。';
-              }
-
-              foundWatermarks.push({
-                type: 'FORENSIC',
-                name: '高度フォレンジック透かし (DWT+DCT+SVD)',
-                robustness: 'High (堅牢)',
-                data: { payload: forensicResult.payload, confidence: forensicResult.confidence },
-                verification: {
-                  valid: forensicResult.payload.length === 22 ? isValid : true,
-                  message: message
-                }
-              });
-            }
+            const imageWMs = analyzeImageWatermarks(imageData, options);
+            foundWatermarks = [...foundWatermarks, ...imageWMs];
           }
         } catch (err) {
-          console.warn("Forensic extraction failed", err);
+          console.warn("Image processing failed", err);
+        }
+      }
+      
+      // 3. 音声FSK透かし（音声・動画の場合）
+      if (!selectedFile.type.startsWith('image/')) {
+        try {
+          console.log("--- 音声解析開始 ---");
+          const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
+            sampleRate: 44100, 
+          });
+          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+          const channelData = audioBuffer.getChannelData(0);
+          
+          const audioWMs = analyzeAudioWatermarks(channelData, { sampleRate: audioBuffer.sampleRate });
+          foundWatermarks = [...foundWatermarks, ...audioWMs];
+        } catch (e) {
+          console.warn("Audio processing failed", e);
         }
       }
 
-      if (foundWatermarks.length === 0) {
+      // 4. すべての透かしをライブラリで一括検証（HMAC署名チェック等）
+      const verifiedResults = await verifyWatermarks(foundWatermarks, secretKey);
+
+      if (verifiedResults.length === 0) {
         setError("電子透かしを検出できませんでした。ファイルが改ざんされているか、透かしが含まれていません。");
       } else {
-        setResults(foundWatermarks);
+        setResults(verifiedResults);
       }
     } catch (err) {
       console.error(err);
@@ -262,7 +351,7 @@ function AnalyzerTab({ secretKey }: { secretKey: string }) {
   );
 }
 
-function SignerTab({ secretKey }: { secretKey: string }) {
+function SignerTab({ secretKey, options }: { secretKey: string, options: ForensicOptions }) {
   const [userId, setUserId] = useState('user_12345');
   const [sessionId, setSessionId] = useState('sess_abcde');
   const [prizeId, setPrizeId] = useState('prize_001');
@@ -270,79 +359,154 @@ function SignerTab({ secretKey }: { secretKey: string }) {
   const [signedJson, setSignedJson] = useState<string>('');
   const [securePayload, setSecurePayload] = useState<string>('');
   
-  const [sourceImage, setSourceImage] = useState<File | null>(null);
+  const [sourceMedia, setSourceMedia] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [progressMsg, setProgressMsg] = useState<string>('');
+  const [isSilentVideo, setIsSilentVideo] = useState(false);
+  
+  const ffmpegRef = useRef(new FFmpeg());
+
+  const loadFFmpeg = async () => {
+    const ffmpeg = ffmpegRef.current;
+    if (ffmpeg.loaded) return;
+    
+    setProgressMsg('WebAssembly Core Loading...');
+    ffmpeg.on('log', ({ message }) => {
+      console.log(message);
+    });
+    
+    try {
+      const baseURL = window.location.origin;
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      });
+    } catch (e: any) {
+      console.error("FFmpeg load failed:", e);
+      throw new Error("Failed to load FFmpeg core: " + (e.message || String(e)));
+    }
+  };
 
   const handleGenerate = async () => {
-    // 1. Generate Signed JSON for EOF
-    const metadata = {
-      userId,
-      sessionId,
-      prizeId,
-      timestamp: new Date().toISOString()
-    };
-    const signed = await signJsonMetadata(metadata, secretKey, ['userId', 'sessionId']);
-    setSignedJson(JSON.stringify(signed, null, 2));
-
-    // 2. Generate Secure Payload for Forensic (22 bytes)
-    const payload = await generateSecurePayload(sessionId, secretKey, 6);
-    setSecurePayload(payload);
+    const payloads = await generateWatermarkPayloads({ userId, sessionId, prizeId }, secretKey);
+    setSignedJson(payloads.jsonString);
+    setSecurePayload(payloads.securePayload);
   };
 
   const handleEmbed = async () => {
-    if (!sourceImage || !signedJson || !securePayload) return;
+    if (!sourceMedia || !signedJson || !securePayload) return;
     setIsProcessing(true);
+    setProgressMsg('処理を開始しています...');
 
     try {
-      const img = new Image();
-      img.src = URL.createObjectURL(sourceImage);
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = reject;
-      });
-
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error("Canvas context not available");
+      const isVideo = sourceMedia.type.startsWith('video/') || sourceMedia.type.startsWith('audio/');
       
-      ctx.drawImage(img, 0, 0);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      
-      // 1. Embed Forensic Watermark (Secure Payload)
-      embedForensic(imageData, securePayload);
-      ctx.putImageData(imageData, 0, 0);
-      
-      // Convert to Blob (PNG)
-      const blob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((b) => {
-          if (b) resolve(b);
-          else reject(new Error("Blob creation failed"));
-        }, 'image/png');
-      });
+      if (isVideo) {
+        setProgressMsg('FFmpeg 準備中...');
+        await loadFFmpeg();
+        const ffmpeg = ffmpegRef.current;
+        
+        // 1. Generate FSK Buffer in memory
+        setProgressMsg('FSK 音声ストリームを生成中...');
+        const fskWavBuffer = generateFskBuffer(securePayload);
+        
+        // 2. Load files into ffmpeg virtual FS
+        setProgressMsg('メディアをメモリに読み込み中...');
+        const inputName = 'input_media' + sourceMedia.name.substring(sourceMedia.name.lastIndexOf('.'));
+        await ffmpeg.writeFile(inputName, await fetchFile(sourceMedia));
+        await ffmpeg.writeFile('fsk.wav', fskWavBuffer);
+        
+        // 3. Execute FFmpeg Command
+        setProgressMsg('動画・音声へ透かしを合成しています...(数分かかる場合があります)');
+        const outputName = sourceMedia.type.startsWith('audio/') ? 'watermarked_output.wav' : 'watermarked_output.mp4';
+        
+        let execCode = 0;
+        if (sourceMedia.type.startsWith('audio/')) {
+          // Audio only processing (mixing)
+          execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '[a]', outputName]);
+        } else {
+          // Video processing
+          if (isSilentVideo) {
+            // Add as standard track
+            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-shortest', outputName]);
+          } else {
+            // Mix with existing audio
+            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', outputName]);
+          }
+        }
+        
+        if (execCode !== 0) {
+          throw new Error("FFmpegプロセスがエラーコードで終了しました。コンソールログを確認してください。無音動画の場合は「強制トラック追加」オプションをお試しください。");
+        }
+        
+        // 4. Download Result
+        setProgressMsg('完了処理中...');
+        const data = await ffmpeg.readFile(outputName);
+        const finalBlob = new Blob([data], { type: sourceMedia.type.startsWith('audio/') ? 'audio/wav' : 'video/mp4' });
+        
+        const url = URL.createObjectURL(finalBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `watermarked_${sourceMedia.name.replace(/\.[^/.]+$/, "")}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+      } else {
+        // --- Image Processing ---
+        setProgressMsg('画像に透かしを埋め込んでいます...');
+        const img = new Image();
+        img.src = URL.createObjectURL(sourceMedia);
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+        });
 
-      // 2. Append EOF Watermark (Signed JSON)
-      const buffer = await blob.arrayBuffer();
-      const uint8Array = new Uint8Array(buffer);
-      const finalBuffer = appendEofWatermark(uint8Array, signedJson);
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error("Canvas context not available");
+        
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        
+        // 1. Embed Forensic Watermark (Secure Payload)
+        embedImageWatermarks(imageData, securePayload, options);
+        ctx.putImageData(imageData, 0, 0);
+        
+        // Convert to Blob (PNG)
+        const blob = await new Promise<Blob>((resolve, reject) => {
+          canvas.toBlob((b) => {
+            if (b) resolve(b);
+            else reject(new Error("Blob creation failed"));
+          }, 'image/png');
+        });
 
-      // Download
-      const finalBlob = new Blob([finalBuffer], { type: 'image/png' });
-      const url = URL.createObjectURL(finalBlob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `watermarked_${sourceImage.name.replace(/\.[^/.]+$/, "")}.png`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+        // 2. Append EOF Watermark (Signed JSON)
+        setProgressMsg('EOFメタデータを付与しています...');
+        const buffer = await blob.arrayBuffer();
+        const finalBuffer = finalizeImageBuffer(new Uint8Array(buffer), signedJson);
 
-    } catch (err) {
+        // Download
+        const finalBlob = new Blob([finalBuffer], { type: 'image/png' });
+        const url = URL.createObjectURL(finalBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `watermarked_${sourceMedia.name.replace(/\.[^/.]+$/, "")}.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+
+    } catch (err: any) {
       console.error(err);
-      alert("埋め込み処理に失敗しました。");
+      alert("埋め込み処理に失敗しました。詳細: " + (err.message || String(err)));
     } finally {
       setIsProcessing(false);
+      setProgressMsg('');
     }
   };
 
@@ -389,28 +553,50 @@ function SignerTab({ secretKey }: { secretKey: string }) {
         </div>
 
         <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm">
-          <h2 className="text-lg font-bold text-gray-900 mb-4">画像への埋め込み</h2>
+          <h2 className="text-lg font-bold text-gray-900 mb-4">メディアへの埋め込み</h2>
           <div className="space-y-4">
             <input 
               type="file" 
-              accept="image/*"
-              onChange={(e) => setSourceImage(e.target.files?.[0] || null)}
+              accept="image/*,video/*,audio/*"
+              onChange={(e) => setSourceMedia(e.target.files?.[0] || null)}
               className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
             />
+            {sourceMedia && sourceMedia.type.startsWith('video/') && (
+              <div className="flex items-center pt-2">
+                <label className="flex items-center gap-2 cursor-pointer bg-gray-50 border border-gray-200 px-3 py-2 rounded-md w-full">
+                  <input 
+                    type="checkbox"
+                    checked={isSilentVideo}
+                    onChange={(e) => setIsSilentVideo(e.target.checked)}
+                    className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                  />
+                  <div className="flex flex-col">
+                    <span className="text-sm font-medium text-gray-700">無音動画への音声トラック追加を許可する</span>
+                    <span className="text-xs text-gray-500">元々音声がない動画に対して、FSK用の透かし音声トラックを強制的に追加します</span>
+                  </div>
+                </label>
+              </div>
+            )}
+            
             <button 
               onClick={handleEmbed}
-              disabled={!sourceImage || !signedJson || isProcessing}
+              disabled={!sourceMedia || !signedJson || isProcessing}
               className="w-full flex items-center justify-center gap-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-md transition-colors"
             >
               {isProcessing ? (
-                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                <div className="flex items-center gap-2">
+                  <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                  <span>{progressMsg}</span>
+                </div>
               ) : (
-                <Download className="w-5 h-5" />
+                <>
+                  <Download className="w-5 h-5" />
+                  透かしを埋め込んでダウンロード
+                </>
               )}
-              透かしを埋め込んでダウンロード
             </button>
             <p className="text-xs text-gray-500 mt-2">
-              ※選択した画像に対して、「高度フォレンジック透かし（不可視）」と「EOFメタデータ（署名付きJSON）」の両方を埋め込みます。
+              ※画像には「不可視画像透かし・EOF」、動画・音声には「FSK音声透かし」が埋め込まれます。動画処理はブラウザの性能により時間がかかります。
             </p>
           </div>
         </div>
@@ -430,11 +616,34 @@ function SignerTab({ secretKey }: { secretKey: string }) {
 
             <div>
               <h3 className="text-sm font-bold text-gray-700 mb-2">2. セキュアペイロード (高度フォレンジック用)</h3>
-              <div className="bg-gray-900 text-green-400 p-4 rounded-lg font-mono text-sm overflow-x-auto">
-                {securePayload ? <pre>{securePayload}</pre> : <span className="text-gray-600">未生成</span>}
+              <div className="bg-gray-900 border border-gray-800 p-4 rounded-lg font-mono text-sm overflow-x-auto">
+                {securePayload ? (
+                  <div className="space-y-3">
+                    <div className="text-green-400 break-all">{securePayload}</div>
+                    
+                    <div className="mt-2 pt-3 border-t border-gray-700 space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="w-4 h-4 rounded bg-blue-500 flex items-center justify-center text-[10px] text-white font-bold">1</span>
+                        <span className="text-gray-300 text-xs flex-1">
+                          <span className="font-semibold text-blue-400 mr-2">セッションID ({securePayload.substring(0, 6).length}文字):</span> 
+                          <span className="bg-gray-800 px-2 py-0.5 rounded text-white">{securePayload.substring(0, 6)}</span>
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="w-4 h-4 rounded bg-purple-500 flex items-center justify-center text-[10px] text-white font-bold">2</span>
+                        <span className="text-gray-300 text-xs flex-1">
+                          <span className="font-semibold text-purple-400 mr-2">HMAC署名 ({securePayload.substring(6).length}文字):</span> 
+                          <span className="bg-gray-800 px-2 py-0.5 rounded text-white">{securePayload.substring(6)}</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <span className="text-gray-600">未生成</span>
+                )}
               </div>
               <p className="text-xs text-gray-500 mt-2">
-                ※22バイト制限: 6文字のID + 16文字のHMAC-SHA256署名
+                ※高度フォレンジックは22バイトの文字数制限があるため、推測不能な 6文字の注文ID + 16文字の改ざん防止用署名 の組み合わせを採用しています。
               </p>
             </div>
           </div>

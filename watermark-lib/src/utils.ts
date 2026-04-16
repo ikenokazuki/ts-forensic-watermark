@@ -191,3 +191,124 @@ export async function verifyJsonSignature(
   const expectedSignature = await generateHmacSha256(signData, secret);
   return metadata.signature === expectedSignature;
 }
+
+/**
+ * Rotates ImageData by a given angle using Bilinear Interpolation.
+ * This is a pure TypeScript implementation, making it isomorphic (Browser/Node).
+ */
+export function rotateImageData(imageData: { data: Uint8ClampedArray | Uint8Array, width: number, height: number }, angle: number): { data: Uint8ClampedArray, width: number, height: number } {
+  const rad = (angle * Math.PI) / 180;
+  const alpha = rad;
+  const sin = Math.sin(alpha);
+  const cos = Math.cos(alpha);
+
+  // For 0 degree, return copy
+  if (Math.abs(angle % 360) < 0.01) {
+    return {
+      data: new Uint8ClampedArray(imageData.data),
+      width: imageData.width,
+      height: imageData.height
+    };
+  }
+
+  // Fast path for 90, 180, 270
+  if (Math.abs(angle % 90) < 0.01) {
+    const a = Math.round(angle / 90) % 4;
+    if (a === 1 || a === -3) return rotate90(imageData);
+    if (a === 2 || a === -2) return rotate180(imageData);
+    if (a === 3 || a === -1) return rotate270(imageData);
+  }
+
+  const { width, height, data } = imageData;
+  const newWidth = Math.floor(Math.abs(width * cos) + Math.abs(height * sin));
+  const newHeight = Math.floor(Math.abs(width * sin) + Math.abs(height * cos));
+  const newData = new Uint8ClampedArray(newWidth * newHeight * 4);
+
+  const cx = width / 2;
+  const cy = height / 2;
+  const ncx = newWidth / 2;
+  const ncy = newHeight / 2;
+
+  for (let y = 0; y < newHeight; y++) {
+    for (let x = 0; x < newWidth; x++) {
+      // Map back to original coordinate space
+      const srcX = (x - ncx) * cos + (y - ncy) * sin + cx;
+      const srcY = (y - ncy) * cos - (x - ncx) * sin + cy;
+
+      if (srcX >= 0 && srcX < width - 1 && srcY >= 0 && srcY < height - 1) {
+        const x0 = Math.floor(srcX);
+        const x1 = x0 + 1;
+        const y0 = Math.floor(srcY);
+        const y1 = y0 + 1;
+
+        const dx = srcX - x0;
+        const dy = srcY - y0;
+
+        for (let c = 0; c < 4; c++) {
+          const p00 = data[(y0 * width + x0) * 4 + c];
+          const p10 = data[(y0 * width + x1) * 4 + c];
+          const p01 = data[(y1 * width + x0) * 4 + c];
+          const p11 = data[(y1 * width + x1) * 4 + c];
+
+          const val = (p00 * (1 - dx) * (1 - dy)) +
+                      (p10 * dx * (1 - dy)) +
+                      (p01 * (1 - dx) * dy) +
+                      (p11 * dx * dy);
+          
+          newData[(y * newWidth + x) * 4 + c] = val;
+        }
+      } else {
+        // Transparent/Black for out-of-bounds
+        newData[(y * newWidth + x) * 4 + 3] = 0;
+      }
+    }
+  }
+
+  return { data: newData, width: newWidth, height: newHeight };
+}
+
+function rotate90(img: any) {
+  const { width: w, height: h, data: d } = img;
+  const newData = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const si = (y * w + x) * 4;
+      const di = (x * h + (h - 1 - y)) * 4;
+      newData[di] = d[si];
+      newData[di + 1] = d[si + 1];
+      newData[di + 2] = d[si + 2];
+      newData[di + 3] = d[si + 3];
+    }
+  }
+  return { data: newData, width: h, height: w };
+}
+
+function rotate180(img: any) {
+  const { width: w, height: h, data: d } = img;
+  const newData = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    const si = i * 4;
+    const di = (w * h - 1 - i) * 4;
+    newData[di] = d[si];
+    newData[di + 1] = d[si + 1];
+    newData[di + 2] = d[si + 2];
+    newData[di + 3] = d[si + 3];
+  }
+  return { data: newData, width: w, height: h };
+}
+
+function rotate270(img: any) {
+  const { width: w, height: h, data: d } = img;
+  const newData = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const si = (y * w + x) * 4;
+      const di = ((w - 1 - x) * h + y) * 4;
+      newData[di] = d[si];
+      newData[di + 1] = d[si + 1];
+      newData[di + 2] = d[si + 2];
+      newData[di + 3] = d[si + 3];
+    }
+  }
+  return { data: newData, width: h, height: w };
+}

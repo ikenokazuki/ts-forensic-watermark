@@ -1,195 +1,172 @@
 # ts-forensic-watermark
 
-フォレンジック電子透かし（ステガノグラフィ）ライブラリです。
-知的財産権の保護を目的として作成されています。HMAC-SHA256署名により透かしが改ざんされていないことを証明し、法的に有効であるように配慮しています。
+セキュアでアイソモルフィック（環境非依存）な電子透かし（フォレンジック・ウォーターマーク）ライブラリです。
+「画像」「動画」「音声」の各種メディアに対して、堅牢で改ざん耐性のある透かしを埋め込むことができます。
 
-コアロジックはピュアTypeScriptで実装されておりブラウザ等でも動作しますが、**利便性を考慮し Node.js 環境向けに `jimp` と `fluent-ffmpeg` を内包した便利なヘルパー関数**を提供しています。これにより、画像のバッファや動画のファイルパスを渡すだけで、一発で透かしの処理が完了します。
+## 💡 設計思想：ライブラリ・ファースト
 
-## インストール
-
-```bash
-npm install ts-forensic-watermark
-```
-*(※ `jimp`、`fluent-ffmpeg`、および `ffmpeg-static` が自動的にインストールされます。FFmpegのバイナリも内包されているため、**OSへのFFmpegの事前インストールは一切不要**ですぐに動画処理が可能です)*
-
-## 使い方 (Node.js 向け便利関数)
-
-### 1. 画像への透かし埋め込み・抽出 (Jimp内蔵)
-
-生のバッファ（`Buffer`）を渡すだけで、内部で自動的に画像をデコード・エンコードします。
-
-```typescript
-import { embedForensicImage, extractForensicImage } from 'ts-forensic-watermark';
-import fs from 'fs';
-
-async function processImage() {
-  // --- 埋め込み ---
-  const inputBuffer = fs.readFileSync('input.jpg');
-  const payload = "SECURE123";
-  
-  // バッファを渡すだけで透かし入りのPNGバッファが返ってきます
-  const watermarkedBuffer = await embedForensicImage(inputBuffer, payload);
-  fs.writeFileSync('output.png', watermarkedBuffer);
-
-  // --- 抽出 ---
-  const result = await extractForensicImage(watermarkedBuffer);
-  if (result && result.payload !== 'RECOVERY_FAILED') {
-    console.log('抽出されたデータ:', result.payload); // "SECURE123"
-    console.log('信頼度:', result.confidence);
-  }
-}
-```
-
-### 2. 動画への透かし埋め込み (FFmpeg内蔵)
-
-動画ファイルに対して、**H.264 SEI** と **MP4 UUID Box** の両方を一度に注入します。再エンコードなし（`copy`）で処理されるため非常に高速です。
-
-```typescript
-import { embedVideoWatermark } from 'ts-forensic-watermark';
-
-async function processVideo() {
-  const inputPath = 'input.mp4';
-  const outputPath = 'output_watermarked.mp4';
-  const payload = JSON.stringify({ userId: "user_001", orderId: "ord_999" });
-
-  // ファイルパスを渡すだけで、SEIとUUID Boxの両方が注入されます
-  await embedVideoWatermark(inputPath, outputPath, payload);
-  console.log('動画への透かし埋め込みが完了しました');
-}
-```
-
-### 3. HMAC-SHA256 署名の生成と検証 (改ざん検知)
-
-透かしデータが第三者によって書き換えられていないことを数学的に証明するための、HMAC署名ユーティリティも内包しています。Node.jsの `crypto` モジュールに依存せず、標準の Web Crypto API を使用しているため環境を問わず動作します。
-
-```typescript
-import { 
-  generateSecurePayload, verifySecurePayload, 
-  signJsonMetadata, verifyJsonSignature 
-} from 'ts-forensic-watermark';
-
-const SECRET_KEY = "my-super-secret-key";
-
-async function testSignatures() {
-  // 1. 高度フォレンジック透かし用の22バイトペイロード (6文字ID + 16文字HMAC)
-  const securePayload = await generateSecurePayload("ORD123", SECRET_KEY);
-  console.log(securePayload); // 例: "ORD123a1b2c3d4e5f6g7h8"
-  
-  const isValid = await verifySecurePayload(securePayload, SECRET_KEY);
-  console.log("ペイロード検証:", isValid); // true
-
-  // 2. EOE追記やUUID Box用のJSONメタデータ署名
-  const metadata = { userId: "user_01", sessionId: "sess_99", timestamp: "2023-10-01T12:00:00Z" };
-  
-  // 指定したフィールドを結合して署名を生成し、オブジェクトに 'signature' を追加
-  const signedMetadata = await signJsonMetadata(metadata, SECRET_KEY, ['userId', 'sessionId']);
-  
-  const isJsonValid = await verifyJsonSignature(signedMetadata, SECRET_KEY, ['userId', 'sessionId']);
-  console.log("JSON署名検証:", isJsonValid); // true
-}
-```
-
-### 4. オプションによるチューニングとID長変更
-
-透かしの堅牢性や画質への影響を調整するためのオプション（`ForensicOptions`）を指定できます。
-
-```typescript
-import { embedForensicImage, extractForensicImage } from 'ts-forensic-watermark';
-
-const options = {
-  delta: 120,              // 彫りの深さ (デフォルト: 120)。高くすると圧縮に強くなりますがノイズが増えます。
-  varianceThreshold: 25,   // 埋め込む面積の広さ (デフォルト: 25)。低くすると平坦な部分にも埋め込みますがノイズが目立ちます。
-  arnoldIterations: 7      // 空間スクランブルの強度 (デフォルト: 7)。抽出時も同じ値が必要です。
-};
-
-// 埋め込み
-const watermarkedBuffer = await embedForensicImage(imageBuffer, 'MyPayload', options);
-
-// 抽出
-const result = await extractForensicImage(watermarkedBuffer, options);
-```
-
-また、セキュアペイロード（デフォルト22バイト）のID長を変更することも可能です。
-
-```typescript
-import { generateSecurePayload, verifySecurePayload } from 'ts-forensic-watermark';
-
-// 10文字のID + 12文字のHMAC署名 (合計22バイト)
-const payload = await generateSecurePayload('USER123456', 'my-secret', 10);
-const isValid = await verifySecurePayload(payload, 'my-secret', 10);
-```
-
-### 5. Web UI デモの使い方
-
-本プロジェクトのルートディレクトリには、このライブラリをブラウザ上で動かすための **Web UI デモ (React + Vite)** が含まれています。サーバーサイドを一切使わず、ブラウザのローカル環境（Web Crypto API と Canvas API）だけで透かしの生成・埋め込み・抽出・署名検証を行う完全な実装例です。
-
-**起動方法:**
-```bash
-# プロジェクトのルートディレクトリで実行
-npm install
-npm run dev
-```
-
-**機能:**
-1. **署名・埋め込み (Sign & Embed) タブ**: 
-   User ID や Session ID などのメタデータを入力し、画像ファイルを選択すると、「高度フォレンジック透かし（不可視）」と「EOFメタデータ（署名付きJSON）」の両方を画像に埋め込んでダウンロードできます。
-2. **透かし解析 (Analyze) タブ**: 
-   透かしが埋め込まれた画像をドラッグ＆ドロップすると、画像から透かしデータを自動抽出し、HMAC署名を用いてデータが改ざんされていないか（真正性）を検証・表示します。
+本プロジェクトでは、すべてのビジネスロジック（透かしの生成、署名、抽出、検証）をライブラリ側にカプセル化しています。WEB UI（Reactなど）は単なるインターフェースに過ぎず、コアロジックはブラウザ、Node.jsサーバー、CLIツールのどこでも同一の関数で動作するアイソモルフィックな設計を採用しています。
 
 ---
 
-## 各透かし技術の背景とメリット・デメリット
+## 🚀 主な機能
 
-本ライブラリでは、用途に応じて複数の透かし技術を使い分けることができます。
+- **[画像] 空間周波数ベースのフォレンジック透かし**: DWT + DCT + SVD を組み合わせた、非可逆圧縮（JPEG等）や劣化に強い不可視透かし。
+- **[動画・音声] FSKオーディオ透かし**: 17kHz〜19kHzの高周波帯域にFSK（周波数偏移変調）を用いてデータを重畳。マイク録音（アナログ・ホール）耐性も備えた高堅牢な技術。
+- **[共通] メタデータ署名 (HMAC-SHA256)**: 透かしデータが改ざんされていないことを数学的に証明。
+- **[共通] リード・ソロモン符号 (ECC)**: ノイズで一部のデータが破損しても、エラー訂正によりペイロードを自己復元。
+
+---
+
+## 📖 導入ガイド：初心者でもわかる埋め込み・検証フロー
+
+本ライブラリは、単一の関数を呼ぶだけでなく、データ生成から合成までの「パイプライン処理」を意識して設計されています。以下の3ステップに従うだけで、安全な透かしシステムを構築できます。
+
+### Step 1: 署名とペイロードの生成 (Signing)
+
+埋め込みたいメタデータ（User IDや注文番号など）から、透かし用のデータを一括生成します。
+
+> [!IMPORTANT]
+> **⚠️ 22バイトの制約について**
+> 高度フォレンジック透かしとFSK音声透かしは、物理的な信号の限界とエラー訂正能力のバランスから、ペイロード容量が **22バイト** に固定されています。
+> 本ライブラリでは **「6文字のセッションID」+「16文字のHMAC署名」** の計22文字を標準セットとして生成します。これにより、短いデータでも改ざん検知が可能です。
+
+### Step 2: メディアへの埋め込み (Embedding Pipeline)
+
+生成したデータをメディアに焼き込みます。画像の場合は「二重の防御」を行うパイプラインが推奨されます。
+
+#### 【画像の場合】
+ピクセルデータへの書き込みと、ファイル末尾への署名付きJSON追記の2段階を適用します。
+
+```typescript
+import { embedImageWatermarks, finalizeImageBuffer } from 'ts-forensic-watermark';
+
+// 1. [ピクセルに書く] 
+embedImageWatermarks(imageData, payloads.securePayload);
+
+// 2. [バイナリ末尾に書く]
+const finalBuffer = finalizeImageBuffer(originalBuffer, payloads.jsonString);
+```
+
+### Step 3: 解析と検証 (Verification)
+
+受け取ったファイルからデータを抽出し、秘密鍵を使って署名が正しいかを確認します。
+
+```typescript
+import { analyzeTextWatermarks, verifyWatermarks } from 'ts-forensic-watermark';
+
+// 1. ファイルをスキャンして透かしデータを見つける（自動判別）
+const foundWMs = analyzeTextWatermarks(fileUint8Array);
+
+// 2. 署名の検証を一括チェック
+const results = await verifyWatermarks(foundWMs, secretKey);
+```
+
+---
+
+## 🔀 パイプライン関数リファレンス
+
+複雑な処理を簡潔に記述するための高レベルAPI群です。
+
+### 1. `generateWatermarkPayloads(metadata, secretKey)`
+透かしに必要な全ての署名済みペイロードを一括生成します。
+- **引数**:
+  - `metadata`: `{ userId, sessionId, ... }` の形式のオブジェクト。
+  - `secretKey`: HMAC署名に使用する秘密鍵。
+- **戻り値**:
+  - `jsonString`: ファイル末尾（EOF）やSEIメタデータに使用する署名済みJSON文字列。
+  - `securePayload`: フォレンジック/FSKで使用する22バイトのセキュア文字列。
+
+### 2. `embedImageWatermarks(imageData, securePayload, options)`
+画像ピクセルデータへの書き込みを行います。
+- **役割**: `ImageData` オブジェクトを直接書き換え、不可視のフォレンジック透かしを埋め込みます。
+
+### 3. `finalizeImageBuffer(buffer, jsonMetadata)`
+ファイルのバイナリに最終的なメタデータを付加します。
+- **役割**: 生成された画像のバイナリ（Uint8Array）の末尾に、署名済みメタデータを追記し、完成したファイルデータを返します。
+
+### 4. `verifyWatermarks(watermarks, secretKey)`
+抽出されたすべての透かし情報の真正性を一括で検証します。
+- **役割**: 各透かしが JSON署名形式か 22バイトセキュア形式かを自動判別し、HMAC検証を実行。検証結果（valid/message）を付加した配列を取得できます。
+
+---
+
+## ⚙️ 詳細パラメータリファレンス
+
+### 1. 高度フォレンジック透かし (`ForensicOptions`)
+| パラメータ | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `delta` | number | `120` | 透かしの強度。高くすると耐性が上がりますがノイズが増えます。 |
+| `varianceThreshold` | number | `25` | 埋め込み場所の選定基準。低いほど平坦な場所にも埋め込みます。 |
+| `arnoldIterations` | number | `7` | 空間変換の反復回数。抽出時にも一致させる必要があります。 |
+| `force` | boolean | `false` | 画像の特性に関わらず強制的に埋め込みます。 |
+| `robustAngles` | number[] | `[0]` | **[NEW]** 抽出時に試行する回転角度リスト。`[0, 90, 180, 270, 0.5, -0.5]` 等を指定することで、回転や微小な傾きに対しても透かしを検出可能になります。 |
+
+> [!TIP]
+> **回転耐性 (Multi-angle Scan) について**
+> 本ライブラリは、指定された角度リストに基づいて画像を動的に回転させながら解析を行います。90/180/270度は高速なビット反転で、0.5度などの微小な傾きは **バイリニア補間** を用いた高精度な回転処理で対応します。
+
+### 2. FSK 音響透かし (`FskOptions`)
+| パラメータ | 型 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- |
+| `amplitude` | number | `2000` | 信号の振幅（音量）。AAC圧縮耐性を高めるには 2000-5000 を推奨。 |
+| `sampleRate` | number | `44100` | サンプリングレート。 |
+| `bitDuration` | number | `0.025` | 1ビットあたりの秒数。 |
+| `freqZero` | number | `18000` | ビット「0」の周波数(Hz)。 |
+| `freqOne` | number | `19000` | ビット「1」の周波数(Hz)。 |
+| `freqSync` | number | `17000` | 同期信号の周波数(Hz)。 |
+
+---
+
+## 📚 各透かし技術の背景とメリット・デメリット
 
 ### 1. 高度フォレンジック透かし (DWT + DCT + SVD)
-* **技術的背景**: 画像の周波数領域に対して透かしを埋め込む高度なステガノグラフィ技術です。離散ウェーブレット変換 (DWT) で画像を帯域分割し、離散コサイン変換 (DCT) と特異値分解 (SVD) を用いて特異値にデータを埋め込みます。さらに、Arnold変換による空間スクランブルと、Reed-Solomon誤り訂正符号 (ECC) を組み合わせることで、データの欠落を防ぎます。
-* **メリット**: 
-  * **極めて高い堅牢性**: JPEG圧縮、リサイズ、切り抜き、ノイズ追加などの画像加工や劣化に対して非常に強い耐性を持ちます。
-  * **不可視性**: 人間の目には透かしが入っていることがほとんど認識できません。
-* **デメリット**: 
-  * **計算コスト**: 複雑な数学的変換を伴うため、CPU負荷が高く処理に時間がかかります。
-  * **ペイロード制限**: 埋め込めるデータ量が非常に少ない（数十バイト程度）ため、IDや短いハッシュの保存に限られます。
+* **背景・技術的詳細**: 
+  * **多重変換プロセス**: 画像を **YCrCb** 色空間に変換し、輝度（Y）成分に対して **DWT (離散ウェーブレット変換)** を行い、画像を4つの周波数帯域（LL, LH, HL, HH）に分解します。さらに重要な低域/中域成分である LH バンドに対して **8x8ブロック単位の DCT (離散コサイン変換)** を適用し、その係数行列に対して **SVD (特異値分解)** を実行します。
+  * **埋め込みアルゴリズム**: 分解された特異値（Singular Values）行列 $S$ の最大値に対して、透かしのビット情報を量子化（QIM: Quantization Index Modulation）処理により刻み込みます。
+  * **自己修復**: 22バイトのペイロードに 8バイトのパリティを付与した **リード・ソロモン誤り訂正 (ECC)** を適用し、自己復旧を可能にしています。
+* **メリット**: JPEG圧縮、リサイズ、ノイズ追加、色調補正などの画像加工や劣化に対して、業界屈指の耐性を誇ります。
+* **デメリット**: 行列演算を多用するため、大容量画像の処理にはデバイスのリソースを消費します。
 
-### 2. EOE (End Of File) メタデータ追記
-* **技術的背景**: 画像（PNG/JPEG）や音声ファイルの終端（EOFマーカーの後）に、直接テキストやバイナリデータを追記する手法です。多くのメディアデコーダは、ファイル終端以降の余剰データを無視して正常に再生・表示する特性を利用しています。
-* **メリット**: 
-  * **無劣化かつ高速**: メディアの品質（画質・音質）に一切影響を与えず、処理も一瞬で完了します。
-  * **大容量**: JSONなどの比較的大きなデータ（メタデータや署名など）をそのまま埋め込むことができます。
-* **デメリット**: 
-  * **脆弱性**: 画像編集ソフトでの上書き保存や、SNS等へのアップロードに伴う再エンコードによって、終端データは簡単に切り捨てられ消失します。
-  * **秘匿性の低さ**: バイナリエディタ等でファイルを開くと、追記されたデータが容易に発見されてしまいます。
+### 2. FSK音響透かし (Audio Watermarking)
+* **背景・技術的詳細**: 
+  * **伝送・変調方式**: デジタルデータを周波数の切り替えで表現する **FSK (Frequency-Shift Keying)** 方式を採用。
+  * **FFT解析による抽出**: 音声信号を **FFT (高速フーリエ変換)** し、各時間窓における特定周波数のエネルギーピークを解析してビット列を復元します。
+  * **リード・ソロモンによる信頼性**: 録音時のノイズや音飛びに対処するため、強力な誤り訂正を標準搭載しています。
+* **メリット**: スピーカー再生音の録音（アナログ再録）に対しても、信号の特徴が残るため追跡可能です。
+* **デメリット**: SNS等の動画圧縮プロセスで高帯域（16kHz以上）を遮断するローパスフィルタが適用されると、消失します。
 
-### 3. MP4 UUID ボックス
-* **技術的背景**: MP4（ISOBMFF）コンテナフォーマットの標準規格である拡張ボックス（`uuid` box）を利用して、独自のメタデータを格納する手法です。
-* **メリット**: 
-  * **規格準拠**: 動画の画質・音質に影響を与えず、フォーマットの規格に則った安全なメタデータ付与が可能です。
-* **デメリット**: 
-  * **再エンコードに弱い**: EOEと同様に、動画共有プラットフォームへのアップロード時やトランスコード処理が行われると、カスタムボックスは削除される可能性が高いです。
+### 3. EOE (End Of File) メタデータ追記
+* **背景・技術的詳細**: ファイルバイナリの終端パターンの後に、HMAC署名付きのJSONデータを直接追記します。デコーダが EOF 以降のデータを無視する仕様を悪用しています。
+* **メリット**: 高速、大容量、メディア品質への影響ゼロ。
+* **デメリット**: 最も「脆い」透かしであり、再保存や形式変換で容易に消滅します。
 
-### 4. H.264 SEI (Supplemental Enhancement Information)
-* **技術的背景**: H.264/H.265ビデオストリームの内部（NALユニット）に直接メタデータを埋め込む手法です。本ライブラリでは、`user_data_unregistered` 形式のペイロード文字列を生成します。
-* **メリット**:
-  * **ストリームへの密結合**: コンテナ（MP4等）ではなくビデオストリーム自体に埋め込まれるため、コンテナの変換（MP4 -> MKV等）や単純なストリームコピーではデータが保持されます。
-* **デメリット**:
-  * **再エンコードに弱い**: 動画プラットフォームによる再圧縮（トランスコード）が行われると、通常はSEIメッセージも破棄されます。
-  * **外部ツールの必要性**: ビデオストリームのNALユニットを直接操作するため、実際のファイルへの書き込みにはFFmpegなどのマルチプレクサが必要です。
+### 4. H.264 SEI / MP4 UUID Box
+* **背景・技術的詳細**: ビデオストリーム（NALユニット）やMP4コンテナの規格化された拡張領域に情報を注入します。
+* **メリット**: メディアプレイヤーとの高い互換性。
+* **デメリット**: SNSアップロード時の再エンコード（トランスコード）で破棄されるのが一般的です。
 
 ---
 
-## 将来の展望 (Roadmap)
+## ⚠️ 運用上の注意点と制限事項
 
-### 音声・動画に対するFSK透かしの実装予定
-将来的なアップデートとして、音声データおよび動画のオーディオトラックに対して、**FSK（周波数偏移変調: Frequency-Shift Keying）を用いた音響透かし（Audio Watermarking）機能**の追加を予定しています。
-
-これにより、スピーカーからの再生音をマイクで録音（アナログ変換・再デジタル化）した場合でも透かしデータが残存する、極めて堅牢な音声フォレンジックトラッキングが本ライブラリ単体で可能になる予定です。
+- **バイト制限**: フォレンジック/FSKは堅牢性維持のため **22バイト** 固定です。長いデータはハッシュ化して埋め込む等の工夫が必要です。
+- **秘密鍵の保管**: `secretKey` を紛失すると検証不可。安全な保管が必須です。
+- **多層防御の推奨**: 高解像度での真正性には EOF、劣化耐性には Forensic というように、複数の技術を併用することを強く推奨します。
 
 ---
 
-## アーキテクチャの設計思想
+## 🏗 アーキテクチャ構成
 
-このライブラリは「計算ロジック」と「ファイルI/O」を完全に分離しています。
-- **本ライブラリが担当するもの**: ピクセル配列の数学的変換（DWT/DCT/SVD）、誤り訂正符号の計算、バイナリデータの構築。
-- **利用側（アプリ側）が担当するもの**: ファイルの読み書き、画像のデコード（Jimp/Canvas）、動画のエンコード（FFmpeg）。
+```mermaid
+graph TD
+    UI[Web UI / CLI / Server] -->|呼出| Manager[analyzer.ts / manager]
+    Manager -->|解析| Core[Core Logic]
+    Manager -->|検証| Crypto[Web Crypto API]
+    Core -->|画像| DWT[DWT+DCT+SVD]
+    Core -->|音声| FSK[FSK Generator/Extractor]
+    Core -->|誤り訂正| RS[Reed-Solomon ECC]
+```
 
-これにより、特定のバックエンド環境に縛られない、極めてポータブルなライブラリとなっています。
+## ライセンス
+MIT License

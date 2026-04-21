@@ -11,17 +11,19 @@ export default defineConfig(({mode}) => {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
     },
     resolve: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       alias: {
         '@': path.resolve(__dirname, '.'),
         // ────────────────────────────────────────────────────────────────
         // Node.js専用モジュールをブラウザビルドから完全に除外するスタブ設定。
         // `false` を指定すると Vite はそのモジュールを空のスタブに解決する。
+        // Vite の型定義は boolean を受け付けないため as any でキャストする。
         // ────────────────────────────────────────────────────────────────
         'jimp':            false,
         'fs':              false,
         'fluent-ffmpeg':   false,
         'ffmpeg-static':   false,
-      },
+      } as any,
     },
     server: {
       hmr: process.env.DISABLE_HMR !== 'true',

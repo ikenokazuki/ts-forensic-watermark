@@ -169,7 +169,7 @@ export class ReedSolomonGF64 {
         const scale = this.mul(d, this.div(1, b));
         const T = this.polyAdd(C, scale === 0 ? new Uint8Array(0) : this.polyScale(Bs, scale));
         if (2 * L <= i) { L = i + 1 - L; B = C; b = d; m = 1; } else m++;
-        C = T;
+        C = T as Uint8Array<ArrayBuffer>;
       }
     }
 

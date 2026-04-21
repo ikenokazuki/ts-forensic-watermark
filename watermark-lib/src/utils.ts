@@ -146,36 +146,41 @@ export async function generateHmacSha256(message: string, secret: string): Promi
 }
 
 /**
- * Generates a 22-byte secure payload (ID + HMAC).
+ * Generates a secure payload (ID + HMAC) for embedding in watermarks.
  * The HMAC portion is Base64url-encoded, giving 96 bits of entropy for the
- * default 16-character HMAC slot (vs. 64 bits for the legacy hex format).
+ * default configuration (payloadLength=22, idLength=6).
  *
- * @param id       The ID to embed
- * @param secret   The secret key for HMAC
- * @param idLength Chars of `id` to use (default: 6). Remaining (22 - idLength) bytes hold the HMAC.
+ * @param id            The ID to embed
+ * @param secret        The secret key for HMAC
+ * @param idLength      Chars of `id` to use (default: 6).
+ * @param payloadLength Total payload length in symbols (default: 22).
+ *                      Must match the `payloadSymbols` option used for embedding/extracting.
+ *                      Remaining (payloadLength - idLength) symbols hold the HMAC.
  */
-export async function generateSecurePayload(id: string, secret: string, idLength: number = 6): Promise<string> {
+export async function generateSecurePayload(id: string, secret: string, idLength: number = 6, payloadLength: number = 22): Promise<string> {
   const idStr = id.substring(0, idLength).padEnd(idLength, '0');
   const hmacBytes = await generateHmacBytes(idStr, secret);
-  const shortHmac = toBase64url(hmacBytes).substring(0, 22 - idLength);
+  const shortHmac = toBase64url(hmacBytes).substring(0, payloadLength - idLength);
   return `${idStr}${shortHmac}`;
 }
 
 /**
- * Verifies a 22-byte secure payload (ID + HMAC).
+ * Verifies a secure payload (ID + HMAC).
  * Accepts both the current Base64url format and the legacy hex format,
  * so watermarks embedded with older versions of the library remain valid.
  *
- * @param payload  The 22-byte payload to verify
- * @param secret   The secret key for HMAC
- * @param idLength The length of the ID (default: 6).
+ * @param payload       The payload to verify
+ * @param secret        The secret key for HMAC
+ * @param idLength      The length of the ID (default: 6).
+ * @param payloadLength Total payload length in symbols (default: 22).
+ *                      Must match the `payloadSymbols` option used for embedding/extracting.
  */
-export async function verifySecurePayload(payload: string, secret: string, idLength: number = 6): Promise<boolean> {
-  if (payload.length !== 22) return false;
+export async function verifySecurePayload(payload: string, secret: string, idLength: number = 6, payloadLength: number = 22): Promise<boolean> {
+  if (payload.length !== payloadLength) return false;
 
   const id = payload.substring(0, idLength);
   const providedHmac = payload.substring(idLength);
-  const hmacLength = 22 - idLength;
+  const hmacLength = payloadLength - idLength;
 
   // Compute HMAC bytes once, then derive both encodings for comparison.
   const hmacBytes = await generateHmacBytes(id, secret);

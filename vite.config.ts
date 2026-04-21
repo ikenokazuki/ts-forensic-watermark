@@ -13,6 +13,14 @@ export default defineConfig(({mode}) => {
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
+        // ────────────────────────────────────────────────────────────────
+        // Node.js専用モジュールをブラウザビルドから完全に除外するスタブ設定。
+        // `false` を指定すると Vite はそのモジュールを空のスタブに解決する。
+        // ────────────────────────────────────────────────────────────────
+        'jimp':            false,
+        'fs':              false,
+        'fluent-ffmpeg':   false,
+        'ffmpeg-static':   false,
       },
     },
     server: {
@@ -23,6 +31,7 @@ export default defineConfig(({mode}) => {
       },
     },
     optimizeDeps: {
+      // @ffmpeg/* はブラウザ向けWASMバンドルのため事前最適化対象から除外
       exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
     },
   };

@@ -1,4 +1,4 @@
-import { ReedSolomon } from './forensic';
+import { ReedSolomonGF64, base64urlToSymbols, symbolsToBase64url } from './rs-gf64';
 
 export interface FskOptions {
   sampleRate?: number;
@@ -9,11 +9,19 @@ export interface FskOptions {
   freqZero?: number;
   freqOne?: number;
   freqSync?: number;
+  /**
+   * データシンボル数 (デフォルト: 22、範囲: 1〜39)。
+   * FSKは合計40シンボル固定。残り (40 - payloadSymbols) がECC。
+   * - 小さくする → ECCが増え誤り訂正能力が上がる（最大19シンボルまで）
+   * - 大きくする → ペイロードが長くなるが誤り訂正能力が下がる
+   * 埋め込み時と抽出時で同じ値を指定してください。
+   */
+  payloadSymbols?: number;
 }
 
-const DATA_LEN = 22;
-const ECC_LEN = 8;
-const rs = new ReedSolomon(ECC_LEN);
+const BITS_PER_SYM = 6;
+const FSK_TOTAL_SYMBOLS = 40; // 固定: 合計40シンボル × 6ビット = 240ビット
+const DEFAULT_PAYLOAD_SYMBOLS = 22;
 
 /**
  * Generates an FSK (Frequency-Shift Keying) encoded WAV buffer.
@@ -35,19 +43,19 @@ export function generateFskBuffer(payload: string, options?: FskOptions): Uint8A
   const freqSync = options?.freqSync ?? 14000;
   const freqZero = options?.freqZero ?? 15000;
   const freqOne  = options?.freqOne  ?? 16000;
-  
+  const dataLen = Math.max(1, Math.min(39, options?.payloadSymbols ?? DEFAULT_PAYLOAD_SYMBOLS));
+  const eccLen = FSK_TOTAL_SYMBOLS - dataLen;
+  const totalBits = FSK_TOTAL_SYMBOLS * BITS_PER_SYM; // 常に240ビット固定
+  const rsInst = new ReedSolomonGF64(eccLen);
+
   const samplesPerBit = Math.floor(sampleRate * bitDuration);
   const syncSamples = Math.floor(sampleRate * syncDuration);
   const marginSamples = Math.floor(sampleRate * marginDuration);
 
-  // Payload processing
-  const dataBytes = new Uint8Array(DATA_LEN);
-  const encoder = new TextEncoder();
-  const encoded = encoder.encode(payload.padEnd(DATA_LEN, '\0'));
-  dataBytes.set(encoded.slice(0, DATA_LEN));
-  
-  const interleaved = rs.encode(dataBytes); // 30 bytes (240 bits)
-  const totalSamples = syncSamples + marginSamples + (240 * samplesPerBit);
+  // Payload processing (GF64: dataLen data + eccLen ECC = 40 symbols × 6 bits = 240 bits)
+  const padded = payload.length >= dataLen ? payload.slice(0, dataLen) : payload + 'A'.repeat(dataLen - payload.length);
+  const interleaved = rsInst.encode(base64urlToSymbols(padded));
+  const totalSamples = syncSamples + marginSamples + (totalBits * samplesPerBit);
   const bufferLen = 44 + totalSamples * 2;
   const buffer = new Uint8Array(bufferLen);
   const dataView = new DataView(buffer.buffer);
@@ -87,10 +95,10 @@ export function generateFskBuffer(payload: string, options?: FskOptions): Uint8A
 
   // 3. データビット (freqZero or freqOne)
   let currentPos = syncSamples + marginSamples;
-  for (let i = 0; i < 240; i++) {
-    const byteIdx = Math.floor(i / 8);
-    const bitIdx = i % 8;
-    const bit = (interleaved[byteIdx] >> (7 - bitIdx)) & 1;
+  for (let i = 0; i < totalBits; i++) {
+    const symIdx = Math.floor(i / BITS_PER_SYM);
+    const bitIdx = i % BITS_PER_SYM;
+    const bit = (interleaved[symIdx] >> (BITS_PER_SYM - 1 - bitIdx)) & 1;
     const freq = bit === 1 ? freqOne : freqZero;
 
     for (let s = 0; s < samplesPerBit; s++) {
@@ -110,12 +118,15 @@ export function generateFskBuffer(payload: string, options?: FskOptions): Uint8A
  */
 export function extractFskBuffer(channelData: Float32Array, options?: FskOptions): string | null {
   const sampleRate = options?.sampleRate || 44100;
-  const bitDuration = options?.bitDuration || 0.025; 
-  const syncDuration = options?.syncDuration || 0.05; 
+  const bitDuration = options?.bitDuration || 0.025;
+  const syncDuration = options?.syncDuration || 0.05;
   const marginDuration = options?.marginDuration || 0.1;
   const freqZero = options?.freqZero ?? 15000;
   const freqOne  = options?.freqOne  ?? 16000;
   const freqSync = options?.freqSync ?? 14000;
+  const dataLen = Math.max(1, Math.min(39, options?.payloadSymbols ?? DEFAULT_PAYLOAD_SYMBOLS));
+  const eccLen = FSK_TOTAL_SYMBOLS - dataLen;
+  const totalBits = FSK_TOTAL_SYMBOLS * BITS_PER_SYM; // 常に240ビット固定
 
   function goertzel(data: Float32Array | Array<number>, freq: number, sampleRate: number) {
     const k = Math.round(0.5 + (data.length * freq) / sampleRate);
@@ -158,10 +169,10 @@ export function extractFskBuffer(channelData: Float32Array, options?: FskOptions
     const bitDuration = 0.025; 
     const samplesPerBit = Math.floor(sampleRate * bitDuration);
     
-    // スキャン設定：タイミングを前後15ms、ビット位置を0〜7ビットずらして全探索
-    const timeShifts = [-10, -5, 0, 5, 10, 15]; // ms単位の候補
+    // スキャン設定：タイミングを前後15ms、ビット位置をずらして全探索
+    const timeShifts = [-10, -5, 0, 5, 10, 15];
     let finalPayload: string | null = null;
-    const rsDec = new ReedSolomon(8);
+    const rsDec = new ReedSolomonGF64(eccLen);
 
     console.log("=== 堅牢スキャニング・デコード開始 ===");
 
@@ -170,43 +181,40 @@ export function extractFskBuffer(channelData: Float32Array, options?: FskOptions
       const adjustedStart = syncStart + Math.floor(sampleRate * ((tShift + marginMs) / 1000));
       if (adjustedStart < 0) continue;
 
-      // 1. まずビットの生配列（0/1の羅列）を作る
       const rawBits: number[] = [];
-      for (let i = adjustedStart; i < channelData.length - samplesPerBit && rawBits.length < 240; i += samplesPerBit) {
+      for (let i = adjustedStart; i < channelData.length - samplesPerBit && rawBits.length < totalBits; i += samplesPerBit) {
         const windowSize = Math.floor(samplesPerBit * 0.5);
         const offset = Math.floor(samplesPerBit * 0.25);
         const windowData = channelData.slice(i + offset, i + offset + windowSize);
-        
+
         const mag0 = goertzel(windowData, freqZero, sampleRate);
         const mag1 = goertzel(windowData, freqOne,  sampleRate);
         rawBits.push(mag1 > mag0 ? 1 : 0);
       }
 
-      // 2. ビットの読み出し開始位置（0〜7ビット）をずらしながらRSデコードを試す
-      for (let bShift = 0; bShift < 8; bShift++) {
-        const shiftedBytes = new Uint8Array(30);
-        for (let b = 0; b < 240 - bShift; b++) {
-          const byteIdx = Math.floor(b / 8);
-          const bitIdx = b % 8;
-          if (byteIdx < 30) {
-            shiftedBytes[byteIdx] |= (rawBits[b + bShift] << (7 - bitIdx));
+      // ビットの読み出し開始位置（0〜5ビット）をずらしながらRSデコードを試す
+      for (let bShift = 0; bShift < BITS_PER_SYM; bShift++) {
+        const symCount = dataLen + eccLen;
+        const shiftedSymbols = new Uint8Array(symCount);
+        for (let b = 0; b < totalBits - bShift; b++) {
+          const symIdx = Math.floor(b / BITS_PER_SYM);
+          const bitIdx = b % BITS_PER_SYM;
+          if (symIdx < symCount) {
+            shiftedSymbols[symIdx] |= (rawBits[b + bShift] << (BITS_PER_SYM - 1 - bitIdx));
           }
         }
+        for (let i = 0; i < symCount; i++) shiftedSymbols[i] &= 0x3F;
 
-        const tryDecode = (targetBytes: Uint8Array) => {
-          let d = rsDec.decode(targetBytes);
-          if (!d) d = rsDec.decode(targetBytes.map(b => b ^ 0xFF)); // 反転試行
+        const tryDecode = (target: Uint8Array) => {
+          let d = rsDec.decode(target);
+          if (!d) d = rsDec.decode(target.map(s => s ^ 0x3F));
           return d;
         };
 
-        const decoded = tryDecode(shiftedBytes);
+        const decoded = tryDecode(shiftedSymbols);
         if (decoded) {
-          let res = '';
-          for (let j = 0; j < decoded.length; j++) {
-            if (decoded[j] === 0) break;
-            res += String.fromCharCode(decoded[j]);
-          }
-          
+          const res = symbolsToBase64url(decoded);
+
           if (res.startsWith("ORD") || res.length >= 6) {
             console.log(`【🎉 解析成功！】Time:${tShift}ms / BitShift:${bShift} でID復元に成功`);
             finalPayload = res.trim();

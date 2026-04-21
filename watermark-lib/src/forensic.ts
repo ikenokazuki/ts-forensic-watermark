@@ -1,5 +1,7 @@
+import { ReedSolomonGF64, base64urlToSymbols, symbolsToBase64url } from './rs-gf64';
+
 // 1. 彫りの深さ
-const DEFAULT_DELTA = 120; 
+const DEFAULT_DELTA = 120;
 
 // 2. 埋め込む面積の広さ
 const DEFAULT_VARIANCE_THRESHOLD = 25; 
@@ -18,6 +20,14 @@ export interface ForensicOptions {
   force?: boolean;
   /** 回転耐性向上のために抽出時に試行する角度リスト (例: [0, 90, 180, 270, 0.5, -0.5]) */
   robustAngles?: number[];
+  /**
+   * データシンボル数 (デフォルト: 22、範囲: 1〜62)。
+   * GF(64)コードワードは最大63シンボル。残り (63 - payloadSymbols) がECC。
+   * - 小さくする → ECCが増え誤り訂正能力が上がる（最大31シンボルまで）
+   * - 大きくする → ペイロードが長くなるが誤り訂正能力が下がる
+   * 埋め込み時と抽出時で同じ値を指定してください。
+   */
+  payloadSymbols?: number;
 }
 
 // ==========================================
@@ -92,7 +102,9 @@ export class ReedSolomon {
       }
     }
     let errPos: number[] = [];
-    for (let i = 0; i < 255; i++) if (this.polyEval(C, this.exp[i]) === 0) errPos.push(255 - i);
+    for (let i = 0; i < 255; i++) {
+      if (this.polyEval(C, this.exp[i]) === 0) errPos.push((255 - i) % 255);
+    }
     if (errPos.length !== L) return null;
 
     let syndR = new Uint8Array(synd).reverse(), omega = this.polyMul(syndR, C).subarray(C.length - 1);
@@ -101,9 +113,12 @@ export class ReedSolomon {
 
     let corrected = new Uint8Array(msg);
     for (let i = 0; i < errPos.length; i++) {
-      let rootInv = this.exp[255 - errPos[i]], pos = corrected.length - 1 - errPos[i];
-      if (pos < 0 || pos >= corrected.length) return null; 
-      corrected[pos] ^= this.mul(this.polyEval(omega, rootInv), this.div(1, this.polyEval(C_d, rootInv)));
+      let rootInv = this.exp[errPos[i] === 0 ? 0 : 255 - errPos[i]];
+      let pos = corrected.length - 1 - errPos[i];
+      if (pos < 0 || pos >= corrected.length) return null;
+      let Xk = this.exp[errPos[i]];
+      let magnitude = this.mul(this.polyEval(omega, rootInv), this.div(1, this.polyEval(C_d, rootInv)));
+      corrected[pos] ^= this.mul(Xk, magnitude);
     }
     return corrected.subarray(0, corrected.length - this.eccLen);
   }
@@ -117,10 +132,9 @@ export class ReedSolomon {
 const MARKER = [1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1];
 const ARNOLD_DIM = 20;
 const TOTAL_BITS = ARNOLD_DIM * ARNOLD_DIM; // 400
-const DATA_LEN = 22; 
-const ECC_LEN = 26;  
-
-const rs = new ReedSolomon(ECC_LEN);
+const BITS_PER_SYM = 6;
+// GF(64)コードワード上限: 63シンボル。デフォルト: データ22 + ECC41 = 63 (最大誤り訂正20シンボル)
+const DEFAULT_PAYLOAD_SYMBOLS = 22;
 
 function getTargetBitIndex(bx: number, by: number, blocksX: number): number {
   return (by * blocksX + bx) % TOTAL_BITS;
@@ -258,23 +272,21 @@ export interface ImageDataLike {
 
 export function embedForensic(imageData: ImageDataLike, payload: string, options?: ForensicOptions) {
   const { data, width, height } = imageData;
-  
+
   const delta = options?.delta ?? DEFAULT_DELTA;
   const varianceThreshold = options?.varianceThreshold ?? DEFAULT_VARIANCE_THRESHOLD;
   const arnoldIter = options?.arnoldIterations ?? DEFAULT_ARNOLD_ITER;
   const force = options?.force ?? false;
-  
-  // ペイロードをDATA_LENバイトに固定
-  const rawBytes = new Uint8Array(DATA_LEN);
-  for (let i = 0; i < Math.min(payload.length, DATA_LEN); i++) {
-    rawBytes[i] = payload.charCodeAt(i);
-  }
-  
-  const encodedBytes = rs.encode(rawBytes); 
+  const dataLen = Math.max(1, Math.min(62, options?.payloadSymbols ?? DEFAULT_PAYLOAD_SYMBOLS));
+  const eccLen = 63 - dataLen;
+  const rsInst = new ReedSolomonGF64(eccLen);
+
+  const padded = payload.length >= dataLen ? payload.slice(0, dataLen) : payload + 'A'.repeat(dataLen - payload.length);
+  const encodedSymbols = rsInst.encode(base64urlToSymbols(padded));
 
   const bitMatrix = new Uint8Array(TOTAL_BITS); bitMatrix.set(MARKER, 0);
-  for (let i = 0; i < encodedBytes.length; i++) for (let j = 0; j < 8; j++) bitMatrix[MARKER.length + i * 8 + j] = (encodedBytes[i] >> (7 - j)) & 1;
-  
+  for (let i = 0; i < encodedSymbols.length; i++) for (let j = 0; j < BITS_PER_SYM; j++) bitMatrix[MARKER.length + i * BITS_PER_SYM + j] = (encodedSymbols[i] >> (BITS_PER_SYM - 1 - j)) & 1;
+
   const scrambledBits = applyArnold(bitMatrix, arnoldIter);
   const blocksX = Math.floor(width / 8), blocksY = Math.floor(height / 8), totalBlocks = blocksX * blocksY;
   const blockIn = new Float32Array(64);
@@ -372,19 +384,19 @@ function getPseudoRandomPattern(width: number, height: number, cellSize: number 
 
 export function generateVideoPattern(width: number, height: number, payload: string, strength: number = 4.0, options?: ForensicOptions): { data: Uint8ClampedArray, width: number, height: number } {
   const arnoldIter = options?.arnoldIterations ?? DEFAULT_ARNOLD_ITER;
-  
+  const dataLen = Math.max(1, Math.min(62, options?.payloadSymbols ?? DEFAULT_PAYLOAD_SYMBOLS));
+  const eccLen = 63 - dataLen;
+  const rsInst = new ReedSolomonGF64(eccLen);
+
   const data = new Uint8ClampedArray(width * height * 4);
   for (let i = 0; i < data.length; i += 4) {
     data[i] = 128; data[i+1] = 128; data[i+2] = 128; data[i+3] = 255;
   }
 
-  const rawBytes = new Uint8Array(DATA_LEN);
-  for (let i = 0; i < Math.min(payload.length, DATA_LEN); i++) {
-    rawBytes[i] = payload.charCodeAt(i);
-  }
-  const encodedBytes = rs.encode(rawBytes); 
+  const padded = payload.length >= dataLen ? payload.slice(0, dataLen) : payload + 'A'.repeat(dataLen - payload.length);
+  const encodedSymbols = rsInst.encode(base64urlToSymbols(padded));
   const bitMatrix = new Uint8Array(TOTAL_BITS); bitMatrix.set(MARKER, 0);
-  for (let i = 0; i < encodedBytes.length; i++) for (let j = 0; j < 8; j++) bitMatrix[MARKER.length + i * 8 + j] = (encodedBytes[i] >> (7 - j)) & 1;
+  for (let i = 0; i < encodedSymbols.length; i++) for (let j = 0; j < BITS_PER_SYM; j++) bitMatrix[MARKER.length + i * BITS_PER_SYM + j] = (encodedSymbols[i] >> (BITS_PER_SYM - 1 - j)) & 1;
   const scrambledBits = applyArnold(bitMatrix, arnoldIter);
 
   const blocksX = 20, blocksY = 20;
@@ -425,7 +437,10 @@ export function generateVideoPattern(width: number, height: number, payload: str
 
 export function extractVideoForensic(imageData: ImageDataLike, options?: ForensicOptions): { payload: string, confidence: number, debug?: any } | null {
   const arnoldIter = options?.arnoldIterations ?? DEFAULT_ARNOLD_ITER;
-  
+  const dataLen = Math.max(1, Math.min(62, options?.payloadSymbols ?? DEFAULT_PAYLOAD_SYMBOLS));
+  const eccLen = 63 - dataLen;
+  const rsInst = new ReedSolomonGF64(eccLen);
+
   const { data, width, height } = imageData;
   const blocksX = 20, blocksY = 20;
   const blockW = Math.floor(width / blocksX);
@@ -481,23 +496,19 @@ export function extractVideoForensic(imageData: ImageDataLike, options?: Forensi
   for (let i = 0; i < MARKER.length; i++) if (extractedBits[i] === MARKER[i]) markerMatch++;
   const markerScore = (markerMatch / MARKER.length) * 100;
 
-  const extractedBytes = new Uint8Array(DATA_LEN + ECC_LEN);
-  for (let i = 0; i < extractedBytes.length; i++) {
-    let charCode = 0;
-    for (let j = 0; j < 8; j++) charCode = (charCode << 1) | extractedBits[MARKER.length + i * 8 + j];
-    extractedBytes[i] = charCode;
+  const extractedSymbols = new Uint8Array(dataLen + eccLen);
+  for (let i = 0; i < extractedSymbols.length; i++) {
+    let sym = 0;
+    for (let j = 0; j < BITS_PER_SYM; j++) sym = (sym << 1) | extractedBits[MARKER.length + i * BITS_PER_SYM + j];
+    extractedSymbols[i] = sym & 0x3F;
   }
 
-  const decodedBytes = rs.decode(extractedBytes);
-  if (!decodedBytes) return { payload: "RECOVERY_FAILED", confidence: markerScore, debug: { markerScore, extractedBytes: Array.from(extractedBytes), decodedBytes: null } };
+  const decodedSymbols = rsInst.decode(extractedSymbols);
+  if (!decodedSymbols) return { payload: "RECOVERY_FAILED", confidence: markerScore, debug: { markerScore, extractedSymbols: Array.from(extractedSymbols), decodedSymbols: null } };
 
-  let result = '';
-  for (let i = 0; i < decodedBytes.length; i++) {
-    if (decodedBytes[i] === 0) break; 
-    result += String.fromCharCode(decodedBytes[i]);
-  }
+  const result = symbolsToBase64url(decodedSymbols);
 
-  return { payload: result, confidence: Math.min(99.9, markerScore), debug: { markerScore, extractedBytes: Array.from(extractedBytes), decodedBytes: Array.from(decodedBytes) } };
+  return { payload: result, confidence: Math.min(99.9, markerScore), debug: { markerScore, extractedSymbols: Array.from(extractedSymbols), decodedSymbols: Array.from(decodedSymbols) } };
 }
 
 export function generateSpreadSpectrumPattern(width: number, height: number, payload: string, strength: number = 0.2, options?: ForensicOptions): { data: Uint8ClampedArray, width: number, height: number } {
@@ -531,6 +542,9 @@ export function extractForensic(imageData: ImageDataLike, options?: ForensicOpti
   const varianceThreshold = options?.varianceThreshold ?? DEFAULT_VARIANCE_THRESHOLD;
   const arnoldIter = options?.arnoldIterations ?? DEFAULT_ARNOLD_ITER;
   const force = options?.force ?? false;
+  const dataLen = Math.max(1, Math.min(62, options?.payloadSymbols ?? DEFAULT_PAYLOAD_SYMBOLS));
+  const eccLen = 63 - dataLen;
+  const rsInst = new ReedSolomonGF64(eccLen);
 
   const bitSums = new Float32Array(TOTAL_BITS), blockIn = new Float32Array(64);
   let processedBlocks = 0;
@@ -582,21 +596,17 @@ export function extractForensic(imageData: ImageDataLike, options?: ForensicOpti
   let confidence = (markerScore * 0.6) + (strengthScore * 0.4);
   if (markerScore < 100) confidence *= Math.pow(markerScore / 100, 3);
 
-  const extractedBytes = new Uint8Array(DATA_LEN + ECC_LEN);
-  for (let i = 0; i < extractedBytes.length; i++) {
-    let charCode = 0;
-    for (let j = 0; j < 8; j++) charCode = (charCode << 1) | extractedBits[MARKER.length + i * 8 + j];
-    extractedBytes[i] = charCode;
+  const extractedSymbols = new Uint8Array(dataLen + eccLen);
+  for (let i = 0; i < extractedSymbols.length; i++) {
+    let sym = 0;
+    for (let j = 0; j < BITS_PER_SYM; j++) sym = (sym << 1) | extractedBits[MARKER.length + i * BITS_PER_SYM + j];
+    extractedSymbols[i] = sym & 0x3F;
   }
 
-  const decodedBytes = rs.decode(extractedBytes);
-  if (!decodedBytes) return { payload: "RECOVERY_FAILED", confidence: markerScore, debug: { markerScore, extractedBytes: Array.from(extractedBytes), decodedBytes: null } };
+  const decodedSymbols = rsInst.decode(extractedSymbols);
+  if (!decodedSymbols) return { payload: "RECOVERY_FAILED", confidence: markerScore, debug: { markerScore, extractedSymbols: Array.from(extractedSymbols), decodedSymbols: null } };
 
-  let result = '';
-  for (let i = 0; i < decodedBytes.length; i++) {
-    if (decodedBytes[i] === 0) break; 
-    result += String.fromCharCode(decodedBytes[i]);
-  }
+  const result = symbolsToBase64url(decodedSymbols);
 
-  return { payload: result, confidence: Math.min(99.9, markerScore), debug: { markerScore, processedBlocks, totalBlocks, extractedBytes: Array.from(extractedBytes), decodedBytes: Array.from(decodedBytes) } };
+  return { payload: result, confidence: Math.min(99.9, markerScore), debug: { markerScore, processedBlocks, totalBlocks, extractedSymbols: Array.from(extractedSymbols), decodedSymbols: Array.from(decodedSymbols) } };
 }

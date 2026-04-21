@@ -22,9 +22,17 @@ Embed robust and tamper-resistant watermarks into **images**, **videos**, and **
    - [analyzeAudioWatermarks — FSK audio watermark extraction](#5-analyzeaudiowatermarks--fsk-audio-watermark-extraction)
    - [analyzeImageWatermarks — forensic image analysis](#6-analyzeimagewatermarks--forensic-image-analysis)
    - [verifyWatermarks — batch cryptographic verification](#7-verifywatermarks--batch-cryptographic-verification)
+   - [embedLlmImageWatermark — LLM DCT frame watermark embedding](#8-embedllmimagewatermark--llm-dct-frame-watermark-embedding)
+   - [analyzeLlmImageWatermarks — LLM DCT frame watermark analysis](#9-analyzellmimagewatermarks--llm-dct-frame-watermark-analysis)
+   - [analyzeAllImageWatermarks — analyze image with all methods at once](#10-analyzeallImagewatermarks--analyze-image-with-all-methods-at-once)
 5. [Node.js-Only Helper API](#nodejs-only-helper-api)
    - [embedForensicImage — direct image embedding](#embedforensicimage--direct-image-embedding)
    - [extractForensicImage — direct image extraction](#extractforensicimage--direct-image-extraction)
+   - [embedLlmVideoFile — LLM DCT embedding for a single image/frame](#embedllmvideofile--llm-dct-embedding-for-a-single-imageframe)
+   - [extractLlmVideoFile — LLM DCT extraction from a single image/frame](#extractllmvideofile--llm-dct-extraction-from-a-single-imageframe)
+   - [embedLlmVideoFrames — LLM DCT embedding across all video frames](#embedllmvideoframes--llm-dct-embedding-across-all-video-frames)
+   - [extractLlmVideoFrames — LLM DCT extraction from a video file](#extractllmvideoframes--llm-dct-extraction-from-a-video-file)
+   - [analyzeVideoLlmWatermarks — video analysis ready for verifyWatermarks](#analyzevideollmwatermarks--video-analysis-ready-for-verifywatermarks)
    - [embedVideoWatermark — video watermark injection](#embedvideowatermark--video-watermark-injection)
 6. [Low-Level API Reference](#low-level-api-reference)
 7. [Parameter Reference](#parameter-reference)
@@ -38,9 +46,11 @@ Embed robust and tamper-resistant watermarks into **images**, **videos**, and **
    - [7. EOF Metadata Append](#7-eof-metadata-append)
    - [8. MP4 UUID Box](#8-mp4-uuid-box)
    - [9. H.264 SEI User Data](#9-h264-sei-user-data)
+   - [10. LLM DCT Frame Watermark](#10-llm-dct-frame-watermark)
 9. [Operational Notes & Trade-offs](#operational-notes--trade-offs)
 10. [Architecture](#architecture)
 11. [Web UI Guide](#web-ui-guide)
+12. [Watermark Method Selection Guide](#watermark-method-selection-guide)
 
 ---
 
@@ -55,9 +65,10 @@ All business logic (generation, signing, extraction, verification) is encapsulat
 | Category | Technology | Robustness |
 | :--- | :--- | :--- |
 | **[Image]** Frequency-based forensic watermark | DWT + DCT + SVD + QIM | High (JPEG / resize resistant) |
+| **[Image/Video]** LLM DCT frame watermark | Loeffler–Ligtenberg–Moschytz 8-point DCT + QIM | High (H.264/H.265 compression resistant) |
 | **[Audio/Video]** FSK acoustic watermark | Frequency-Shift Keying (14–16 kHz) + Goertzel | High (analog recording + AAC compression resistant) |
 | **[Shared]** Metadata signing | HMAC-SHA256 (Web Crypto API) | Tamper detection |
-| **[Shared]** Error correction | Reed-Solomon ECC | Self-healing |
+| **[Shared]** Error correction | Reed-Solomon ECC (GF64) | Self-healing |
 | **[Shared]** Spatial scrambling | Arnold transform | Analysis resistance |
 
 ---
@@ -540,7 +551,7 @@ import { analyzeImageWatermarks } from 'ts-forensic-watermark';
 const watermarks = analyzeImageWatermarks(imageData, {
   delta: 120,
   arnoldIterations: 7,
-  robustAngles: [0, 90, 180, 270, 0.5, -0.5]
+  robustAngles: [0, 90, 180, 270, 0.5, -0.5, 1, -1, 2, -2, 3, -3]
 });
 
 watermarks.forEach(wm => {
@@ -553,7 +564,10 @@ watermarks.forEach(wm => {
 **`robustAngles` guide:**
 - `[0]` — default, no rotation (fastest)
 - `[0, 90, 180, 270]` — handles right-angle rotations
-- `[0, 0.5, -0.5, 1, -1]` — handles slight tilts (slower but more robust)
+- `[0, 90, 180, 270, 0.5, -0.5, 1, -1]` — handles slight tilts (scanner-level)
+- `[0, 90, 180, 270, 0.5, -0.5, 1, -1, 2, -2, 3, -3]` — **recommended**; covers photos of screens taken with a smartphone (tilts up to ±3°)
+
+> **Note:** Each angle runs one full extraction pass. Since the loop exits immediately on success, putting `0` first (no rotation) is the most efficient ordering. Arbitrary angles beyond ±5° disrupt DCT block boundaries enough to exceed Reed-Solomon's correction capacity.
 
 ---
 
@@ -590,7 +604,107 @@ results.forEach(wm => {
 | Type | Verification method | Signed fields |
 | :--- | :--- | :--- |
 | `EOF`, `UUID_BOX`, `H264_SEI` | JSON signature (HMAC-SHA256 over `userId:sessionId`) | `userId`, `sessionId` |
-| `AUDIO_FSK`, `FORENSIC` | Secure payload (22-byte HMAC) | Entire payload |
+| `AUDIO_FSK`, `FORENSIC`, `LLM_VIDEO` | Secure payload (HMAC) | Entire payload |
+
+---
+
+### 8. `embedLlmImageWatermark` — LLM DCT frame watermark embedding
+
+**Purpose:** Embeds an LLM DCT watermark directly into an `ImageData` object (from the browser Canvas API or a Node.js canvas polyfill). This is the LLM DCT equivalent of `embedImageWatermarks` (DWT+DCT+SVD).
+
+```typescript
+import { embedLlmImageWatermark, generateWatermarkPayloads } from 'ts-forensic-watermark';
+
+const payloads = await generateWatermarkPayloads(
+  { userId: "user_001", sessionId: "TX9901" },
+  "my-secret-key-2024"
+);
+
+// Browser example: get ImageData from Canvas and embed
+const canvas = document.createElement('canvas');
+const ctx = canvas.getContext('2d');
+ctx.drawImage(videoFrame, 0, 0);
+const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+embedLlmImageWatermark(imageData, payloads.securePayload, {
+  quantStep: 300,       // quantization step (recommended: 300)
+  coeffRow: 2,          // DCT coefficient position — row
+  coeffCol: 1,          // DCT coefficient position — column
+  arnoldIterations: 7,  // scramble depth
+  payloadSymbols: 22,   // number of data symbols
+});
+
+ctx.putImageData(imageData, 0, 0); // write modified pixels back
+```
+
+---
+
+### 9. `analyzeLlmImageWatermarks` — LLM DCT frame watermark analysis
+
+**Purpose:** Analyzes and extracts an LLM DCT watermark from `ImageData`, returning results in `DetectedWatermark[]` format. This is the LLM DCT equivalent of `analyzeImageWatermarks` (DWT+DCT+SVD). Supports multi-angle extraction via `robustAngles`.
+
+```typescript
+import { analyzeLlmImageWatermarks, verifyWatermarks } from 'ts-forensic-watermark';
+
+// Browser example: get ImageData from Canvas and analyze
+const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+const watermarks = analyzeLlmImageWatermarks(imageData, {
+  quantStep: 300,
+  arnoldIterations: 7,
+  payloadSymbols: 22,
+  robustAngles: [0, 90, 180, 270, 0.5, -0.5, 1, -1, 2, -2, 3, -3],
+});
+
+// Verify
+const verified = await verifyWatermarks(watermarks, "my-secret-key-2024", 6, 22);
+verified.forEach(wm => {
+  console.log(`[${wm.type}] payload: ${wm.data.payload}`);
+  console.log(`  Confidence: ${wm.data.confidence.toFixed(1)}%`);
+  console.log(`  Signature: ${wm.verification?.valid ? 'authentic' : 'failed'}`);
+});
+```
+
+---
+
+### 10. `analyzeAllImageWatermarks` — analyze image with all methods at once
+
+**Purpose:** Tries both DWT+DCT+SVD forensic and LLM DCT extraction on the same `ImageData` in one call, returning all detected watermarks. Useful when the embedding method is unknown or both methods may be present.
+
+```typescript
+import { analyzeAllImageWatermarks, verifyWatermarks } from 'ts-forensic-watermark';
+
+// Get ImageData from Canvas
+const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+// Try both DWT+DCT+SVD and LLM DCT
+const allWatermarks = analyzeAllImageWatermarks(
+  imageData,
+  // forensicOptions (optional — defaults to delta:120)
+  { delta: 120, arnoldIterations: 7, payloadSymbols: 22 },
+  // llmOptions (optional — defaults to quantStep:300)
+  { quantStep: 300, arnoldIterations: 7, payloadSymbols: 22 }
+);
+
+// Verify all at once
+const verified = await verifyWatermarks(allWatermarks, "my-secret-key-2024", 6, 22);
+
+verified.forEach(wm => {
+  const method = wm.type === 'FORENSIC' ? 'DWT+DCT+SVD' : 'LLM DCT';
+  console.log(`[${method}] payload: ${wm.data.payload}`);
+  console.log(`  Confidence: ${wm.data.confidence?.toFixed(1)}%`);
+  console.log(`  Signature: ${wm.verification?.valid ? '✅ authentic' : '❌ failed'}`);
+});
+```
+
+**Comparison with `analyzeImageWatermarks`:**
+
+| | `analyzeImageWatermarks` | `analyzeAllImageWatermarks` |
+|:---|:---|:---|
+| Methods tried | DWT+DCT+SVD only | DWT+DCT+SVD + LLM DCT |
+| Arguments | `(imageData, forensicOptions)` | `(imageData, forensicOptions?, llmOptions?)` |
+| Use case | Method is known | Method unknown / detect both |
+| Speed | Faster | Slightly slower (runs both) |
 
 ---
 
@@ -671,6 +785,135 @@ if (result && result.payload !== 'RECOVERY_FAILED') {
 
 **Automatic fallback:** Internally tries `delta: 120` first, then falls back to `delta: 60` if extraction fails, covering watermarks embedded with different strength settings.
 
+### `embedLlmVideoFile` — LLM DCT embedding for a single image/frame
+
+Reads a single image file (PNG/JPG) with Jimp, embeds an LLM DCT watermark, and returns the result as a PNG buffer. Intended for still images or individual frames.
+
+```typescript
+import { embedLlmVideoFile, generateWatermarkPayloads } from 'ts-forensic-watermark';
+
+const payloads = await generateWatermarkPayloads(
+  { userId: "user_001", sessionId: "TX9901" },
+  "my-secret-key-2024"
+);
+
+const outputBuffer = await embedLlmVideoFile(
+  './frame.png',           // ImageInput: Buffer, file path, or URL
+  payloads.securePayload,  // payload to embed (Base64url)
+  { quantStep: 300, coeffRow: 2, coeffCol: 1, arnoldIterations: 7, payloadSymbols: 22 },
+  './output_frame.png'     // optional — also writes to disk when provided
+);
+```
+
+### `extractLlmVideoFile` — LLM DCT extraction from a single image/frame
+
+```typescript
+import { extractLlmVideoFile, verifySecurePayload } from 'ts-forensic-watermark';
+
+const result = await extractLlmVideoFile('./output_frame.png', {
+  quantStep: 300, arnoldIterations: 7, payloadSymbols: 22,
+});
+if (result) {
+  console.log("Payload:", result.payload);
+  console.log("Confidence:", result.confidence); // 0–100 (sync marker match rate)
+}
+```
+
+### `embedLlmVideoFrames` — LLM DCT embedding across all video frames
+
+Embeds a watermark into every frame of a video file. Internal flow:
+
+1. FFmpeg extracts all frames as numbered PNG files (temp directory)
+2. Jimp reads each frame → `embedLlmVideoFrame` embeds → overwrites PNG
+3. FFmpeg re-encodes PNG sequence + original audio → H.264 / yuv420p output
+4. Temp directory is deleted
+
+```typescript
+import { embedLlmVideoFrames, generateWatermarkPayloads } from 'ts-forensic-watermark';
+
+const payloads = await generateWatermarkPayloads(
+  { userId: "user_001", sessionId: "TX9901" },
+  "my-secret-key-2024"
+);
+
+await embedLlmVideoFrames(
+  './input.mp4',           // input video path
+  payloads.securePayload,  // payload to embed
+  './output_wm.mp4',       // output video path
+  { quantStep: 300, arnoldIterations: 7, payloadSymbols: 22 }
+);
+
+console.log("All frames watermarked.");
+```
+
+> **Note:** Processing time scales linearly with frame count. A 1-minute 30 fps video requires ~1,800 frames to be processed.
+
+### `extractLlmVideoFrames` — LLM DCT extraction from a video file
+
+Samples frames at even intervals and returns the highest-confidence extraction result.
+
+```typescript
+import { extractLlmVideoFrames, verifySecurePayload } from 'ts-forensic-watermark';
+
+const result = await extractLlmVideoFrames('./output_wm.mp4', {
+  quantStep: 300,
+  arnoldIterations: 7,
+  payloadSymbols: 22,
+  sampleFrames: 10,  // sample up to 10 frames at 1-second intervals (default: 10)
+});
+
+if (result) {
+  console.log("Payload:", result.payload);
+  console.log("Confidence:", result.confidence);
+  const isValid = await verifySecurePayload(result.payload, "my-secret-key-2024", 6, 22);
+  console.log("Signature:", isValid ? "authentic" : "tampered");
+} else {
+  console.log("Extraction failed (Reed-Solomon uncorrectable)");
+}
+```
+
+| Parameter | Description | Default |
+|:---|:---|:---|
+| `sampleFrames` | Number of frames to sample (1 per second) | 10 |
+| `quantStep` / `arnoldIterations` / `payloadSymbols` | Must match embedding-time settings | 300 / 7 / 22 |
+
+### `analyzeVideoLlmWatermarks` — video analysis ready for `verifyWatermarks`
+
+Wraps `extractLlmVideoFrames` output into `DetectedWatermark[]` format so it can be passed directly to `verifyWatermarks` — watermark extraction and signature verification in a single pipeline.
+
+```typescript
+import { analyzeVideoLlmWatermarks, verifyWatermarks } from 'ts-forensic-watermark';
+
+const secretKey = "my-secret-key-2024";
+
+// ① Sample frames from video → DetectedWatermark[]
+const watermarks = await analyzeVideoLlmWatermarks('./output_wm.mp4', {
+  quantStep: 300,
+  arnoldIterations: 7,
+  payloadSymbols: 22,
+  sampleFrames: 10,
+});
+
+// ② Pass directly to verifyWatermarks
+const verified = await verifyWatermarks(watermarks, secretKey, 6, 22);
+
+verified.forEach(wm => {
+  console.log(`[${wm.type}] payload: ${wm.data.payload}`);
+  console.log(`  Confidence: ${wm.data.confidence.toFixed(1)}%`);
+  console.log(`  Signature: ${wm.verification?.valid ? '✅ authentic' : '❌ tampered'}`);
+});
+```
+
+**Comparison of extraction functions:**
+
+| Function | Environment | Return type | Directly usable with `verifyWatermarks` |
+|:---|:---:|:---:|:---:|
+| `extractLlmVideoFrames` | Node.js | `{payload, confidence}\|null` | ❌ |
+| `analyzeVideoLlmWatermarks` | Node.js | `DetectedWatermark[]` | ✅ |
+| `analyzeLlmImageWatermarks` | Browser / Node.js | `DetectedWatermark[]` | ✅ (single image/frame) |
+
+---
+
 ### `embedVideoWatermark` — video watermark injection
 
 **Purpose:** Injects watermarks into an H.264 video via SEI units and an MP4 UUID Box. No re-encoding — video quality and bitrate are unchanged.
@@ -742,6 +985,76 @@ const result = extractForensic(imageDataLike, { delta: 200, arnoldIterations: 5 
 // null  — image too small
 // { payload: "RECOVERY_FAILED", confidence: 30 }  — ECC failed
 ```
+
+### LLM DCT frame core (`llm-dct.ts`)
+
+#### `embedLlmVideoFrame(imageData, payload, options?)`
+
+Embeds an LLM DCT + QIM watermark into every 8×8 block of an ImageData (mutates in-place).
+
+```typescript
+import { embedLlmVideoFrame } from 'ts-forensic-watermark';
+
+const imageDataLike = {
+  data: new Uint8ClampedArray(width * height * 4), // RGBA
+  width: 1920,
+  height: 1080
+};
+
+embedLlmVideoFrame(imageDataLike, "TX9901SGVsbG8hV29ybGQ-", {
+  quantStep: 300,        // QIM quantization step (default: 300)
+  coeffRow: 2,           // DCT coefficient row (default: 2)
+  coeffCol: 1,           // DCT coefficient column (default: 1)
+  arnoldIterations: 7,   // Arnold scramble iterations (default: 7)
+  payloadSymbols: 22,    // data symbols (default: 22, ECC=41)
+});
+// imageDataLike.data is mutated in-place — no return value
+```
+
+**Coefficient position guide:**
+
+| Position (row, col) | Frequency band | Compression resistance | Visibility |
+|:---:|:---|:---:|:---:|
+| (0, 0) | DC component | Highest | Noticeable |
+| (1–2, 0–2) | Low frequency (recommended) | High | Slightly visible |
+| (3–4, 3–4) | Mid frequency | Medium | Nearly invisible |
+| (5–7, 5–7) | High frequency | Low | Invisible |
+
+#### `extractLlmVideoFrame(imageData, options?)`
+
+Extracts an LLM DCT watermark via soft majority voting.
+
+```typescript
+import { extractLlmVideoFrame } from 'ts-forensic-watermark';
+
+const result = extractLlmVideoFrame(imageDataLike, {
+  quantStep: 300,   // must match embedding settings
+  coeffRow: 2,
+  coeffCol: 1,
+  arnoldIterations: 7,
+  payloadSymbols: 22,
+});
+
+if (result) {
+  console.log("payload:", result.payload);
+  // confidence: 16-bit sync marker match rate (0–100)
+  // values above 50 suggest successful extraction
+  console.log("confidence:", result.confidence.toFixed(1) + "%");
+} else {
+  // Reed-Solomon uncorrectable (error count exceeded ECC capacity)
+  console.log("Extraction failed");
+}
+```
+
+**Return value:**
+
+| Field | Type | Description |
+|:---|:---|:---|
+| `payload` | `string` | Recovered Base64url payload |
+| `confidence` | `number` | Sync marker match rate 0–100. Values below 50 are suspect |
+| `null` | — | Reed-Solomon correction failed |
+
+---
 
 ### Audio core (`fsk.ts`)
 
@@ -832,6 +1145,19 @@ if (extracted) console.log(JSON.parse(extracted).userId);
 | `arnoldIterations` | number | `7` | **Arnold transform iterations.** Controls the spatial scrambling depth. **Must be identical at embedding and extraction** — any mismatch causes complete extraction failure. |
 | `force` | boolean | `false` | When `true`, skips variance and SVD threshold checks to force-embed in every block. Used for tests and video pattern generation. |
 | `robustAngles` | number[] | `[0]` | Angles to try during extraction via `analyzeImageWatermarks`. More angles = higher rotation robustness but slower. |
+
+### LlmVideoOptions (LLM DCT frame watermark settings)
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `quantStep` | number | `300` | **QIM quantization step.** Higher values survive H.264/H.265 compression better but introduce more visible brightness change. Recommended range: 200–500. |
+| `coeffRow` | number | `2` | **DCT coefficient row** to embed into. Lower values (1–2) target low-frequency coefficients and are more compression-resistant. Must match between embedding and extraction. |
+| `coeffCol` | number | `1` | **DCT coefficient column** to embed into. Same guidance as `coeffRow`. |
+| `arnoldIterations` | number | `7` | **Arnold transform iterations.** Controls scrambling depth. **Must be identical at embedding and extraction** — any mismatch causes complete extraction failure. |
+| `payloadSymbols` | number | `22` | **Number of data symbols.** Controls the payload / ECC split. Must match between embedding and extraction. |
+| `robustAngles` | number[] | `[0]` | Angles to try during extraction via `analyzeLlmImageWatermarks`. More angles = higher rotation robustness but slower. |
+
+---
 
 ### FskOptions (FSK audio watermark settings)
 
@@ -1153,6 +1479,81 @@ Two complementary methods are used:
 
 ---
 
+### 10. LLM DCT Frame Watermark
+
+#### Overview
+
+LLM (Loeffler–Ligtenberg–Moschytz, 1989) is a butterfly-network algorithm that computes the 8-point 1D DCT using only **5 multiplications and 29 additions**. It achieves the same transform as standard JPEG DCT without calling `Math.cos` or `Math.sqrt` at runtime — all constants are pre-computed.
+
+**Pre-computed constants used (6 values):**
+
+| Constant | Value | Meaning |
+|:---|:---|:---|
+| `LLM_C4` | 0.7071… | cos(4π/16) = 1/√2 |
+| `LLM_C6` | 0.3826… | cos(6π/16) |
+| `LLM_C2mC6` | 0.5411… | cos(2π/16) − cos(6π/16) |
+| `LLM_C2pC6` | 1.3065… | cos(2π/16) + cos(6π/16) |
+| `LLM_2C2` | 1.8477… | 2·cos(2π/16) |
+| `LLM_SQRT2` | 1.4142… | √2 |
+
+#### Embedding algorithm
+
+```
+1. RS encode: payload → GF(64) Reed-Solomon codeword (data + ECC = 63 symbols)
+2. Arnold scramble: shuffle 400 bits with Arnold transform
+3. Scan all 8×8 blocks across the frame
+   ├── Load Y luminance channel into Float32Array(64)
+   ├── fdct2d(): 2D LLM DCT (rows then columns, 8 passes each)
+   ├── QIM embed at coefficient [coeffRow, coeffCol]:
+   │     bit=1 → q*Q + 0.75*Q
+   │     bit=0 → q*Q + 0.25*Q
+   ├── idct2d(): 2D LLM inverse DCT (columns then rows)
+   └── ÷64 scale correction + add delta to RGB, clamp
+4. Bits are cyclically embedded across all blocks (redundancy)
+```
+
+#### Extraction algorithm
+
+```
+1. Scan all blocks
+   ├── fdct2d() → read target coefficient
+   └── Soft QIM: accumulate (val % Q + Q) % Q - Q/2 (majority vote)
+2. Hard decision: sign of accumulated value → bit
+3. Inverse Arnold scramble
+4. RS decode: error-correct to recover payload
+5. Confidence: 16-bit sync marker match rate (0–100%)
+```
+
+#### Strengths and weaknesses
+
+**Strengths:**
+- Stable embedding in video frames, uniform images (gradients, screenshots, CG)
+- Survives H.264/H.265 compression (increase `quantStep` for higher resistance)
+- Works on images as small as 8×8 pixels (lower minimum size than DWT+DCT+SVD)
+- Fast processing (5 multiplications + 29 additions per butterfly)
+- Well-suited for embedding across all frames of a video
+- Rotation-robust extraction supported via `robustAngles` in `analyzeLlmImageWatermarks`
+
+**Weaknesses:**
+- Less effective at hiding in natural photographs (cannot exploit complex texture)
+- Heavy JPEG compression (quality < 30) or large resizes reduce reliability (mitigate by raising `quantStep`)
+- Cropping (most of the image removed) destroys redundancy
+- Applying DWT+DCT+SVD and LLM DCT to the same image simultaneously causes interference — use only one method per image
+
+#### Comparison with DWT+DCT+SVD
+
+| Property | LLM DCT | DWT+DCT+SVD |
+|:---|:---|:---|
+| Best target | Video frames, uniform images | Natural photos, high-texture images |
+| Speed | Fast (minimal arithmetic) | Moderate (DWT subband processing) |
+| Compression resistance | High (tunable via `quantStep`) | High (SVD singular value modulation) |
+| Luminance change | ±few levels (depends on `quantStep`) | ±`delta` value (depends on texture) |
+| Minimum image size | 8×8 pixels | 32×32 pixels (DWT requirement) |
+| Rotation robustness | ✅ via `robustAngles` | ✅ via `robustAngles` |
+| ECC | GF(64) RS (63 symbols) | GF(64) RS (63 symbols) |
+
+---
+
 ### 9. H.264 SEI User Data
 
 #### Overview
@@ -1234,10 +1635,16 @@ The 22-byte design maximises ECC length (= robustness) while preserving enough i
 
 | Media | Recommended watermarks | Verification method |
 | :--- | :--- | :--- |
-| Image (distribution) | Pixel forensic + EOF | `analyzeImageWatermarks` + `analyzeTextWatermarks` |
-| Video (high robustness) | SEI + UUID Box + FSK audio | `analyzeTextWatermarks` + `analyzeAudioWatermarks` |
+| Photo / natural image (distribution) | DWT+DCT+SVD pixel + EOF | `analyzeImageWatermarks` + `analyzeTextWatermarks` |
+| Solid-color / graph / screenshot | LLM DCT pixel + EOF | `analyzeLlmImageWatermarks` + `analyzeTextWatermarks` |
+| Video (FSK only, lightweight) | FSK audio | `analyzeAudioWatermarks` |
+| Video (all-frame pixel watermark) | LLM DCT all frames + FSK audio | `analyzeLlmImageWatermarks` (frame sampling) + `analyzeAudioWatermarks` |
+| Video (text-based, fastest) | SEI + UUID Box | `analyzeTextWatermarks` |
 | Audio | FSK | `analyzeAudioWatermarks` |
-| Screenshot protection | Pixel forensic (high delta: 200) | `analyzeImageWatermarks` |
+| Screen capture protection (photo) | DWT+DCT+SVD (high delta: 200) | `analyzeImageWatermarks` |
+| Screen capture protection (video) | LLM DCT all frames (high quantStep: 500) | `analyzeLlmImageWatermarks` (frame sampling) |
+
+> ⚠️ **Do not apply DWT+DCT+SVD and LLM DCT to the same image simultaneously.** Both methods modulate the same pixel regions and will interfere with each other, making neither reliably extractable.
 
 ---
 
@@ -1246,13 +1653,19 @@ The 22-byte design maximises ECC length (= robustness) while preserving enough i
 ```mermaid
 graph TD
     UI[Web UI / CLI / Server] -->|call| Manager["analyzer.ts (Manager)"]
-    Manager -->|image analysis| ImgAnalyze[analyzeImageWatermarks]
+    Manager -->|DWT+DCT+SVD analysis| ImgAnalyze[analyzeImageWatermarks]
+    Manager -->|LLM DCT analysis| LlmAnalyze[analyzeLlmImageWatermarks]
+    Manager -->|all-method analysis| AllAnalyze[analyzeAllImageWatermarks]
     Manager -->|audio analysis| AudAnalyze[analyzeAudioWatermarks]
     Manager -->|text analysis| TxtAnalyze[analyzeTextWatermarks]
     Manager -->|crypto verify| Verify[verifyWatermarks]
 
+    AllAnalyze --> ImgAnalyze
+    AllAnalyze --> LlmAnalyze
+
     ImgAnalyze -->|rotation trial| Rotate[rotateImageData]
     ImgAnalyze -->|frequency analysis| Forensic[forensic.ts]
+    LlmAnalyze -->|LLM DCT analysis| LlmCore[llm-dct.ts]
     AudAnalyze -->|Goertzel detection| FSK[fsk.ts]
     TxtAnalyze -->|EOF scan| EOF[appendEofWatermark]
     TxtAnalyze -->|SEI parse| SEI[H264 SEI Parser]
@@ -1264,13 +1677,23 @@ graph TD
     DCT --> SVD[SVD Singular Value Decomposition]
     SVD --> QIM[QIM Quantization Index Modulation]
     QIM --> Arnold[Arnold Transform Scrambling]
-    Arnold --> RS_Img[Reed-Solomon ECC 26 bytes]
+    Arnold --> RS_Img[Reed-Solomon GF64 ECC]
+
+    LlmCore -->|LLM 8-point 1D DCT| LLMDCT[Loeffler-Ligtenberg-Moschytz DCT]
+    LLMDCT --> QIM_LLM[QIM Quantization Index Modulation]
+    QIM_LLM --> Arnold_LLM[Arnold Transform Scrambling]
+    Arnold_LLM --> RS_LLM[Reed-Solomon GF64 ECC]
 
     FSK --> Goertzel[Goertzel frequency detection]
-    FSK --> RS_Fsk[Reed-Solomon ECC 8 bytes]
+    FSK --> RS_Fsk[Reed-Solomon GF64 ECC]
 
-    NodeHelper["node.ts (Node.js only)"] -->|Jimp| Forensic
-    NodeHelper -->|FFmpeg| Video[Video SEI / UUID Box injection]
+    NodeHelper["node.ts (Node.js only)"] -->|Jimp + DWT+DCT+SVD| Forensic
+    NodeHelper -->|Jimp + LLM DCT| LlmCore
+    NodeHelper -->|FFmpeg all-frame expand| FrameEmbed[embedLlmVideoFrames]
+    NodeHelper -->|FFmpeg frame sampling| FrameAnalyze[analyzeVideoLlmWatermarks]
+    NodeHelper -->|FFmpeg SEI/UUID Box| Video[Video metadata injection]
+    FrameEmbed --> LlmCore
+    FrameAnalyze --> LlmCore
 ```
 
 ---
@@ -1288,18 +1711,38 @@ Must be **identical** at embedding time and verification time. Used for HMAC sig
 
 #### Advanced settings panel (gear button)
 
+**Common settings**
+
+| Setting | Range | Recommended | Description |
+|---------|-------|-------------|-------------|
+| Payload Symbols | 10/15/22/30/40 | 22 | Symbol count shared across image, LLM DCT, and FSK. Smaller = stronger ECC |
+| Secure ID Length | 4/6/8/10/12 | 6 | Chars of sessionId used as ID. Trade-off vs. HMAC strength |
+
+**Image watermark settings**
+
 | Setting | Range | Recommended | Description |
 |---------|-------|-------------|-------------|
 | Delta | 10–255 | 120 | Higher = more JPEG-resistant but more visible noise |
 | Variance Threshold | 0–100 | 25 | Skip flat image regions (sky, walls). 0 = embed everywhere |
 | Arnold Iterations | 1–20 | 7 | Scramble depth. **Must match** between embed and analyze |
 | Force | ON/OFF | OFF | Ignore variance check — use for blank/white images |
+| Rotation detection | ON/OFF | OFF | When ON, scans 0°/90°/180°/270° and fine tilts up to ±3° (slower) |
+
+**Audio / Video (FSK) settings**
+
+| Setting | Range | Recommended | Description |
+|---------|-------|-------------|-------------|
 | Bit Duration | 0.01–0.1 s | 0.025 | Longer = more robust FSK, but longer signal |
 | FSK Amplitude | 10–5000 | 50 | Higher = easier to detect, but may become audible |
-| Secure ID Length | 4/6/8/10/12 | 6 | Chars of sessionId used. Trade-off vs. HMAC strength |
-| Rotation detection | ON/OFF | OFF | When ON, scans ±90/180/270° and small tilts (slower) |
 
-> **Important:** Delta, Arnold Iterations, and Secure ID Length must be the same at embedding and analysis time.
+**Video frame watermark (LLM DCT) settings**
+
+| Setting | Range | Recommended | Description |
+|---------|-------|-------------|-------------|
+| Quant Step | 50–1000 | 300 | Higher = more H.264 compression resistant but more luminance change |
+| Coeff Position | row 1–6 / col 0–6 | row 2, col 1 | DCT coefficient to embed into. Low-frequency positions (rows/cols 1–3) recommended |
+
+> **Important:** Delta, Arnold Iterations, Quant Step, Payload Symbols, and Secure ID Length must be identical at embedding and analysis time.
 
 ---
 
@@ -1319,8 +1762,10 @@ Verify watermarks in an uploaded file.
    | EOF metadata | All | Low |
    | MP4 UUID Box | Video | Low |
    | H.264 SEI | Video | High |
-   | Image forensic (DWT+DCT+SVD) | Image | High |
+   | DWT+DCT+SVD forensic watermark | Image | High |
+   | LLM DCT frame watermark | Image | High |
    | FSK audio (14–16 kHz) | Audio / Video | High |
+   | LLM DCT video frame watermark (sampled) | Video | High |
 
 3. **Review results.** Each detected watermark shows:
    - Type and robustness label
@@ -1351,32 +1796,67 @@ Produces the `securePayload` (22-byte string for image/FSK embedding) and the si
 
 **Step 3 — Upload your media file**
 
-**Step 4 (video/audio only) — Silent video option**
+**Step 4 (image only — optional) — Select embedding method**
 
-If the source video has no audio track, enable **"強制トラック追加 (Force track)"**. Without this, the FFmpeg mix command will fail on silent videos.
+| Checkbox | Description |
+|----------|-------------|
+| **[Image] Use LLM DCT watermark** | OFF = DWT+DCT+SVD, ON = LLM DCT. Use LLM DCT for video frames, graphs, and screenshots |
+
+**Step 4 (video only — optional) — LLM DCT all-frame embedding**
+
+| Checkbox | Description |
+|----------|-------------|
+| **[Video] Embed LLM DCT watermark in all frames** | When ON, every frame is extracted as PNG, watermarked with LLM DCT, then re-encoded together with the FSK audio watermark. Processing time scales with frame count |
+
+> **Silent video:** If the source video has no audio track, an FSK audio track is added automatically. No checkbox is needed.
 
 **Step 5 — Click "Embed & Download"**
 
 | File type | Embedded watermarks | Output format |
 |-----------|--------------------|----|
-| Image (PNG/JPG) | Pixel forensic watermark + EOF metadata | PNG |
-| Video (MP4) | FSK audio track (14–16 kHz, AAC 192 kb/s) | MP4 |
+| Image (DWT+DCT+SVD mode) | DWT+DCT+SVD pixel watermark + EOF metadata | PNG |
+| Image (LLM DCT mode) | LLM DCT pixel watermark + EOF metadata | PNG |
+| Video (FSK only) | FSK audio track (14–16 kHz, AAC 192 kb/s) | MP4 |
+| Video (FSK + LLM DCT) | LLM DCT all frames + FSK audio watermark | MP4 |
 | Audio (MP3, etc.) | FSK signal mixed with original audio | WAV |
 
-> **Video processing note:** Uses a WebAssembly build of FFmpeg — everything runs in the browser with no server upload. The first run may take several seconds to load the WASM binary. The FSK signal (~6 s) is inserted as the audio track of the output video.
+> **Video processing note:** Uses a WebAssembly build of FFmpeg — everything runs in the browser with no server upload. The first run may take several seconds to load the WASM binary. The FSK signal (~6 s) is inserted at the beginning of the output video audio track.
 
 ---
 
 ### Troubleshooting
 
 **Nothing detected on the Analyze tab**  
-→ Check that ① the Secret Key matches, ② Delta / Arnold Iterations match, ③ the video has not been re-encoded (which destroys the FSK track).
+→ Check that ① the Secret Key matches, ② Delta / Arnold Iterations / Quant Step match, ③ the video has not been re-encoded (which destroys the FSK track).
 
 **Error during video embedding**  
-→ Enable **"Force track"** if the source video is silent. Also confirm the file is MP4.
+→ Confirm the file is MP4. Silent videos are handled automatically (FSK audio track is added); if an error still occurs, check the browser console log.
 
 **FSK tone is audible**  
 → Reduce the FSK Amplitude slider. The default value of 50 is inaudible at normal listening levels. Higher values may be perceptible to young listeners.
+
+---
+
+## Watermark Method Selection Guide
+
+Use this guide when you are unsure which watermark method to choose.
+
+### Recommended patterns by media type
+
+| Media | Recommended method | Reason |
+| :--- | :--- | :--- |
+| **Photo / natural image (PNG/JPG)** | DWT+DCT+SVD (`embedImageWatermarks`) | Exploits complex texture to hide the watermark. High JPEG and resize resistance |
+| **Solid-color / graph / screenshot** | LLM DCT (`embedLlmImageWatermark`) | Uniformly modulates DCT coefficients even in flat images |
+| **Video (all-frame pixel watermark)** | LLM DCT all-frame (`embedLlmVideoFrames`) | Independent watermark in every frame; survives partial clipping and screen capture |
+| **Video (via audio channel)** | FSK (`generateFskBuffer` + FFmpeg) | No video re-encoding required; lightweight processing |
+| **Video (maximum robustness)** | LLM DCT frames + FSK audio (both) | Independent watermarks in both video and audio; resistant to muting or frame-only attacks |
+| **Audio file (MP3/WAV)** | FSK (`generateFskBuffer` + FFmpeg) | The only method that survives analog-hole attacks (recording speaker playback with a phone) |
+
+### ❗ Combinations to avoid
+
+| Combination | Reason |
+| :--- | :--- |
+| **DWT+DCT+SVD + LLM DCT on the same image** | Both methods modulate the same pixel regions and interfere with each other, making neither reliably extractable |
 
 ## License
 MIT License

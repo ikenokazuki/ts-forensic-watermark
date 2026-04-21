@@ -5,21 +5,94 @@ import { cn } from './lib/utils';
 // index.ts は Node.js専用の node.ts（jimp, fs, fluent-ffmpeg）をre-exportするため
 // ブラウザ環境では browser.ts を使う必要があります。
 // browser.ts = forensic + utils + fsk + analyzer のみ（Node.js依存なし）
-import { 
+import {
   generateWatermarkPayloads,
   embedImageWatermarks,
+  embedLlmImageWatermark,
   finalizeImageBuffer,
   analyzeTextWatermarks,
   analyzeAudioWatermarks,
   analyzeImageWatermarks,
+  analyzeLlmImageWatermarks,
   verifyWatermarks,
   generateFskBuffer,
-  ForensicOptions
+  embedLlmVideoFrame,
+  extractLlmVideoFrame,
+  ForensicOptions,
+  LlmVideoOptions
 } from '../watermark-lib/src/browser';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { toBlobURL, fetchFile } from '@ffmpeg/util';
 
 type Tab = 'analyze' | 'sign';
+
+// ─── ブラウザ用 PNG ↔ ImageData 変換ヘルパー ────────────────────────────────
+async function pngBytesToImageData(bytes: Uint8Array): Promise<ImageData> {
+  const copy = new Uint8Array(bytes);
+  const blob = new Blob([copy.buffer as ArrayBuffer], { type: 'image/png' });
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = reject;
+      img.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function imageDataToPngBytes(imageData: ImageData): Promise<Uint8Array> {
+  const canvas = document.createElement('canvas');
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.putImageData(imageData, 0, 0);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(b => b ? resolve(b) : reject(new Error('toBlob failed')), 'image/png');
+  });
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+// ─── 動画から均等間隔でフレームをサンプリング（ブラウザネイティブ） ────────
+async function sampleVideoFrames(file: File, count: number): Promise<ImageData[]> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = async () => {
+      const duration = video.duration || 10;
+      const step = duration / (count + 1);
+      const timestamps = Array.from({ length: count }, (_, i) => step * (i + 1));
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d')!;
+      const frames: ImageData[] = [];
+      for (const ts of timestamps) {
+        await new Promise<void>(r => {
+          video.onseeked = () => {
+            ctx.drawImage(video, 0, 0);
+            frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+            r();
+          };
+          video.currentTime = ts;
+        });
+      }
+      URL.revokeObjectURL(url);
+      resolve(frames);
+    };
+    video.onerror = () => { URL.revokeObjectURL(url); reject(new Error('video load failed')); };
+    video.src = url;
+  });
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('analyze');
@@ -30,14 +103,23 @@ export default function App() {
     varianceThreshold: 25,
     arnoldIterations: 7,
     force: false,
-    robustAngles: [0, 90, 180, 270, 0.5, -0.5, 1, -1]
+    robustAngles: [0, 90, 180, 270, 0.5, -0.5, 1, -1, 2, -2, 3, -3]
   });
   const [fskOptions, setFskOptions] = useState({
     bitDuration: 0.025,
     amplitude: 50,
   });
   const [secureIdLength, setSecureIdLength] = useState(6);
+  const [payloadSymbols, setPayloadSymbols] = useState(22);
   const [isRobustDetection, setIsRobustDetection] = useState(true);
+  const [llmOptions, setLlmOptions] = useState<LlmVideoOptions>({
+    quantStep: 300,
+    coeffRow: 2,
+    coeffCol: 1,
+    arnoldIterations: 7,
+  });
+  const [useLlmEmbed, setUseLlmEmbed] = useState(false);
+  const [useLlmVideoEmbed, setUseLlmVideoEmbed] = useState(false);
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
@@ -93,144 +175,249 @@ export default function App() {
           </div>
 
           {showSettings && (
-            <div className="pt-4 border-t border-gray-200 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+            <div className="pt-4 border-t border-gray-200 flex flex-col gap-4">
+
+              {/* ── 共通設定 ── */}
               <div>
-                <label className="block text-sm justify-between flex mb-1">
-                  <span className="font-medium text-gray-700">Delta (彫りの深さ)</span>
-                  <span className="text-gray-500">{forensicOptions.delta}</span>
-                </label>
-                <input 
-                  type="range" min="10" max="255" step="10"
-                  value={forensicOptions.delta}
-                  onChange={(e) => setForensicOptions({ ...forensicOptions, delta: Number(e.target.value) })}
-                  className="w-full"
-                />
-                <p className="text-xs text-gray-500">高くすると圧縮耐性が上がりますが、ノイズが目立ちます。(推奨: 120)</p>
-              </div>
-              
-              <div>
-                <label className="block text-sm justify-between flex mb-1">
-                  <span className="font-medium text-gray-700">Variance Threshold (分散閾値)</span>
-                  <span className="text-gray-500">{forensicOptions.varianceThreshold}</span>
-                </label>
-                <input 
-                  type="range" min="0" max="100" step="5"
-                  value={forensicOptions.varianceThreshold}
-                  onChange={(e) => setForensicOptions({ ...forensicOptions, varianceThreshold: Number(e.target.value) })}
-                  className="w-full"
-                />
-                <p className="text-xs text-gray-500">平坦な部分（青空など）への埋め込みを避ける閾値です。(推奨: 25)</p>
-              </div>
+                <h3 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">共通設定（全メディア対象）</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Payload Symbols (ペイロード長)</label>
+                    <select
+                      value={payloadSymbols}
+                      onChange={(e) => {
+                        const next = Number(e.target.value);
+                        setPayloadSymbols(next);
+                        // ID長がペイロード長を超えないよう自動調整
+                        if (secureIdLength >= next) setSecureIdLength(Math.min(6, next - 1));
+                      }}
+                      className="w-full px-3 py-1.5 border border-gray-300 rounded-md text-sm"
+                    >
+                      {[
+                        { v: 10, label: '10 シンボル — 画像・LLM DCT ECC53 / FSK ECC30（超高耐性）' },
+                        { v: 15, label: '15 シンボル — 画像・LLM DCT ECC48 / FSK ECC25（高耐性）' },
+                        { v: 22, label: '22 シンボル — 画像・LLM DCT ECC41 / FSK ECC18（推奨）' },
+                        { v: 30, label: '30 シンボル — 画像・LLM DCT ECC33 / FSK ECC10（長いID向け）' },
+                        { v: 40, label: '40 シンボル — 画像・LLM DCT ECC23 / FSK ECC0（非推奨）' },
+                      ].map(({ v, label }) => (
+                        <option key={v} value={v}>{label}</option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      小さいほどECCが強くなり破損耐性が向上します。<span className="text-amber-600 font-medium">埋め込みと解析で必ず同じ値を使用してください。</span>
+                    </p>
+                  </div>
 
-              <div>
-                <label className="block text-sm justify-between flex mb-1">
-                  <span className="font-medium text-gray-700">Arnold Iterations (スクランブル強度)</span>
-                  <span className="text-gray-500">{forensicOptions.arnoldIterations}</span>
-                </label>
-                <input 
-                  type="range" min="1" max="20" step="1"
-                  value={forensicOptions.arnoldIterations}
-                  onChange={(e) => setForensicOptions({ ...forensicOptions, arnoldIterations: Number(e.target.value) })}
-                  className="w-full"
-                />
-                <p className="text-xs text-gray-500">空間スプレッドの反復回数です。(推奨: 7)</p>
-              </div>
-
-              <div className="flex items-center pt-6">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input 
-                    type="checkbox"
-                    checked={forensicOptions.force}
-                    onChange={(e) => setForensicOptions({ ...forensicOptions, force: e.target.checked })}
-                    className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
-                  />
-                  <span className="text-sm font-medium text-gray-700">Force (強制埋め込み)</span>
-                </label>
-                <p className="text-xs text-gray-500 ml-3">分散閾値を無視して真っ白な画像などにも埋め込みます。</p>
-              </div>
-
-              <div className="md:col-span-2 pt-2 border-t border-gray-100 mt-2">
-                <h3 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">音声・動画 (FSK) & 高度な設定</h3>
-              </div>
-
-              <div>
-                <label className="block text-sm justify-between flex mb-1">
-                  <span className="font-medium text-gray-700">Bit Duration (1ビット長)</span>
-                  <span className="text-gray-500">{fskOptions.bitDuration}s</span>
-                </label>
-                <input 
-                  type="range" min="0.01" max="0.1" step="0.005"
-                  value={fskOptions.bitDuration}
-                  onChange={(e) => setFskOptions({ ...fskOptions, bitDuration: Number(e.target.value) })}
-                  className="w-full"
-                />
-                <p className="text-xs text-gray-500">長いほど堅牢ですが、透かし信号が長くなります。(推奨: 0.025)</p>
-              </div>
-
-              <div>
-                <label className="block text-sm justify-between flex mb-1">
-                  <span className="font-medium text-gray-700">FSK Amplitude (振幅)</span>
-                  <span className="text-gray-500">{fskOptions.amplitude}</span>
-                </label>
-                <input 
-                  type="range" min="10" max="5000" step="10"
-                  value={fskOptions.amplitude}
-                  onChange={(e) => setFskOptions({ ...fskOptions, amplitude: Number(e.target.value) })}
-                  className="w-full"
-                />
-                <p className="text-xs text-gray-500">高いほど検出率が上がりますが、ノイズが聞こえやすくなります。(推奨: 2000)</p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Secure ID Length (ID長)</label>
-                <select 
-                  value={secureIdLength}
-                  onChange={(e) => setSecureIdLength(Number(e.target.value))}
-                  className="w-full px-3 py-1.5 border border-gray-300 rounded-md text-sm"
-                >
-                  {[4, 6, 8, 10, 12].map(v => (
-                    <option key={v} value={v}>{v} 文字 (署名: {22 - v} 文字)</option>
-                  ))}
-                </select>
-                <p className="text-xs text-gray-500 mt-1">※署名時と解析時でこの値を一致させる必要があります。</p>
-              </div>
-
-              <div className="pt-6">
-                <div className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-100 rounded-md">
-                   <label className="flex items-center gap-2 cursor-pointer">
-                    <input 
-                      type="checkbox"
-                      checked={isRobustDetection}
-                      onChange={(e) => setIsRobustDetection(e.target.checked)}
-                      className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
-                    />
-                    <span className="text-xs text-gray-700 font-medium">画像回転耐性を有効にする (低速)</span>
-                  </label>
-                  <p className="text-[10px] text-gray-500 pl-6">
-                    画像を 90/180/270度、および ±0.5/1度回転させてスキャンします。傾いた写真でも検出可能です。
-                  </p>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Secure ID Length (ID長)</label>
+                    <select
+                      value={secureIdLength}
+                      onChange={(e) => setSecureIdLength(Number(e.target.value))}
+                      className="w-full px-3 py-1.5 border border-gray-300 rounded-md text-sm"
+                    >
+                      {[4, 6, 8, 10, 12].filter(v => v < payloadSymbols).map(v => {
+                        const hmacBits = (payloadSymbols - v) * 6;
+                        const rec =
+                          hmacBits >= 96 ? (v <= 4 ? '★セキュリティ優先' : '★推奨') :
+                          hmacBits >= 80 ? 'NIST最小基準充足' :
+                          hmacBits >= 64 ? '⚠ 注意' : '⛔ 非推奨';
+                        return (
+                          <option key={v} value={v}>
+                            {v}文字 — HMAC {payloadSymbols - v}文字/{hmacBits}bit ({rec})
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      ID長が長いほどHMACが短くなり署名の偽造耐性が低下します。<span className="text-amber-600 font-medium">署名時と解析時で必ず一致させてください。</span>
+                    </p>
+                  </div>
                 </div>
               </div>
+
+              {/* ── 画像透かし設定 ── */}
+              <div className="pt-2 border-t border-gray-100">
+                <h3 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">画像透かし設定</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">Delta (彫りの深さ)</span>
+                      <span className="text-gray-500">{forensicOptions.delta}</span>
+                    </label>
+                    <input
+                      type="range" min="10" max="255" step="10"
+                      value={forensicOptions.delta}
+                      onChange={(e) => setForensicOptions({ ...forensicOptions, delta: Number(e.target.value) })}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">高くすると圧縮耐性が上がりますが、ノイズが目立ちます。(推奨: 120)</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">Variance Threshold (分散閾値)</span>
+                      <span className="text-gray-500">{forensicOptions.varianceThreshold}</span>
+                    </label>
+                    <input
+                      type="range" min="0" max="100" step="5"
+                      value={forensicOptions.varianceThreshold}
+                      onChange={(e) => setForensicOptions({ ...forensicOptions, varianceThreshold: Number(e.target.value) })}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">平坦な部分（青空など）への埋め込みを避ける閾値です。(推奨: 25)</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">Arnold Iterations (スクランブル強度)</span>
+                      <span className="text-gray-500">{forensicOptions.arnoldIterations}</span>
+                    </label>
+                    <input
+                      type="range" min="1" max="20" step="1"
+                      value={forensicOptions.arnoldIterations}
+                      onChange={(e) => setForensicOptions({ ...forensicOptions, arnoldIterations: Number(e.target.value) })}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">空間スプレッドの反復回数です。(推奨: 7)</p>
+                  </div>
+
+                  <div className="flex flex-col gap-3 pt-6">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={forensicOptions.force}
+                        onChange={(e) => setForensicOptions({ ...forensicOptions, force: e.target.checked })}
+                        className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                      />
+                      <span className="text-sm font-medium text-gray-700">Force (強制埋め込み)</span>
+                    </label>
+                    <p className="text-xs text-gray-500">分散閾値を無視して真っ白な画像などにも埋め込みます。</p>
+
+                    <div className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-100 rounded-md">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={isRobustDetection}
+                          onChange={(e) => setIsRobustDetection(e.target.checked)}
+                          className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                        />
+                        <span className="text-xs text-gray-700 font-medium">画像回転耐性を有効にする（低速）</span>
+                      </label>
+                      <p className="text-[10px] text-gray-500 pl-6">
+                        画像を 90/180/270度、±0.5/1度回転させてスキャンします。傾いた写真でも検出可能です。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── 音声・動画 (FSK) 設定 ── */}
+              <div className="pt-2 border-t border-gray-100">
+                <h3 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">音声・動画 (FSK) 設定</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">Bit Duration (1ビット長)</span>
+                      <span className="text-gray-500">{fskOptions.bitDuration}s</span>
+                    </label>
+                    <input
+                      type="range" min="0.01" max="0.1" step="0.005"
+                      value={fskOptions.bitDuration}
+                      onChange={(e) => setFskOptions({ ...fskOptions, bitDuration: Number(e.target.value) })}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">長いほど堅牢ですが、透かし信号が長くなります。(推奨: 0.025)</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">FSK Amplitude (振幅)</span>
+                      <span className="text-gray-500">{fskOptions.amplitude}</span>
+                    </label>
+                    <input
+                      type="range" min="10" max="5000" step="10"
+                      value={fskOptions.amplitude}
+                      onChange={(e) => setFskOptions({ ...fskOptions, amplitude: Number(e.target.value) })}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">高いほど検出率が上がりますが、ノイズが聞こえやすくなります。(推奨: 2000)</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── 動画フレーム (LLM DCT) 設定 ── */}
+              <div className="pt-2 border-t border-gray-100">
+                <h3 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">動画フレーム透かし (LLM DCT) 設定</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">Quant Step (量子化ステップ)</span>
+                      <span className="text-gray-500">{llmOptions.quantStep}</span>
+                    </label>
+                    <input
+                      type="range" min="50" max="1000" step="50"
+                      value={llmOptions.quantStep}
+                      onChange={(e) => setLlmOptions({ ...llmOptions, quantStep: Number(e.target.value) })}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">大きいほどH.264圧縮への耐性が上がりますが、輝度変化が大きくなります。(推奨: 300)</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">Coeff Position (係数位置 行, 列)</span>
+                      <span className="text-gray-500">({llmOptions.coeffRow}, {llmOptions.coeffCol})</span>
+                    </label>
+                    <div className="flex gap-2">
+                      <select
+                        value={llmOptions.coeffRow}
+                        onChange={(e) => setLlmOptions({ ...llmOptions, coeffRow: Number(e.target.value) })}
+                        className="flex-1 px-2 py-1.5 border border-gray-300 rounded-md text-sm"
+                      >
+                        {[1,2,3,4,5,6].map(v => <option key={v} value={v}>行 {v}</option>)}
+                      </select>
+                      <select
+                        value={llmOptions.coeffCol}
+                        onChange={(e) => setLlmOptions({ ...llmOptions, coeffCol: Number(e.target.value) })}
+                        className="flex-1 px-2 py-1.5 border border-gray-300 rounded-md text-sm"
+                      >
+                        {[0,1,2,3,4,5,6].map(v => <option key={v} value={v}>列 {v}</option>)}
+                      </select>
+                    </div>
+                    <p className="text-xs text-gray-500">埋め込み先のDCT係数位置。低周波(1〜3)が推奨。(推奨: 行2, 列1)</p>
+                  </div>
+                </div>
+              </div>
+
             </div>
           )}
         </div>
 
         {activeTab === 'analyze' ? (
-          <AnalyzerTab 
-            secretKey={secretKey} 
+          <AnalyzerTab
+            secretKey={secretKey}
             options={{
               ...forensicOptions,
+              payloadSymbols,
               robustAngles: isRobustDetection ? forensicOptions.robustAngles : [0]
-            }} 
-            fskOptions={fskOptions}
+            }}
+            fskOptions={{ ...fskOptions, payloadSymbols }}
+            llmOptions={{ ...llmOptions, payloadSymbols, robustAngles: isRobustDetection ? forensicOptions.robustAngles : [0] }}
             secureIdLength={secureIdLength}
+            payloadSymbols={payloadSymbols}
           />
         ) : (
-          <SignerTab 
-            secretKey={secretKey} 
-            options={forensicOptions} 
-            fskOptions={fskOptions}
+          <SignerTab
+            secretKey={secretKey}
+            options={{ ...forensicOptions, payloadSymbols }}
+            fskOptions={{ ...fskOptions, payloadSymbols }}
+            llmOptions={{ ...llmOptions, payloadSymbols }}
+            useLlmEmbed={useLlmEmbed}
+            setUseLlmEmbed={setUseLlmEmbed}
+            useLlmVideoEmbed={useLlmVideoEmbed}
+            setUseLlmVideoEmbed={setUseLlmVideoEmbed}
             secureIdLength={secureIdLength}
+            payloadSymbols={payloadSymbols}
           />
         )}
       </main>
@@ -238,7 +425,7 @@ export default function App() {
   );
 }
 
-function AnalyzerTab({ secretKey, options, fskOptions, secureIdLength }: { secretKey: string, options: ForensicOptions, fskOptions: any, secureIdLength: number }) {
+function AnalyzerTab({ secretKey, options, fskOptions, llmOptions, secureIdLength, payloadSymbols }: { secretKey: string, options: ForensicOptions, fskOptions: any, llmOptions: LlmVideoOptions, secureIdLength: number, payloadSymbols: number }) {
   const [file, setFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [results, setResults] = useState<any[]>([]);
@@ -281,6 +468,8 @@ function AnalyzerTab({ secretKey, options, fskOptions, secureIdLength }: { secre
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
             const imageWMs = analyzeImageWatermarks(imageData, options);
             foundWatermarks = [...foundWatermarks, ...imageWMs];
+            const llmWMs = analyzeLlmImageWatermarks(imageData, llmOptions);
+            foundWatermarks = [...foundWatermarks, ...llmWMs];
           }
         } catch (err) {
           console.warn("Image processing failed", err);
@@ -307,13 +496,52 @@ function AnalyzerTab({ secretKey, options, fskOptions, secureIdLength }: { secre
         }
       }
 
-      // 4. すべての透かしをライブラリで一括検証（HMAC署名チェック等）
-      const verifiedResults = await verifyWatermarks(foundWatermarks, secretKey, secureIdLength);
+      // 4. 動画フレームの LLM DCT 透かし解析（動画の場合のみ・ブラウザネイティブ）
+      if (selectedFile.type.startsWith('video/')) {
+        try {
+          const frames = await sampleVideoFrames(selectedFile, 5);
+          let best: { payload: string; confidence: number } | null = null;
+          for (const frame of frames) {
+            const result = extractLlmVideoFrame(frame, llmOptions);
+            if (result && (!best || result.confidence > best.confidence)) best = result;
+          }
+          if (best && best.payload) {
+            foundWatermarks.push({
+              type: 'LLM_VIDEO',
+              name: 'LLM DCT動画フレーム透かし (Reed-Solomon自己修復)',
+              robustness: 'High (堅牢)',
+              data: { payload: best.payload, confidence: best.confidence }
+            });
+          }
+        } catch (e) {
+          console.warn('LLM DCT video frame analysis failed', e);
+        }
+      }
 
-      if (verifiedResults.length === 0) {
+      // 5. すべての透かしをライブラリで一括検証（HMAC署名チェック等）
+      const verifiedResults = await verifyWatermarks(foundWatermarks, secretKey, secureIdLength, payloadSymbols);
+
+      // 6. ピクセル系透かし（FORENSIC / LLM_VIDEO）の表示フィルタ
+      // (a) confidence ≤ 50 かつ全A（全ゼロビット）のペイロードは抽出失敗のゴミデータとして除外
+      // (b) 片方の方式が有効な検証済みである場合、もう片方の「失敗」結果は
+      //     方式不一致による誤検出なので表示しない
+      const isNullPayload = (w: typeof verifiedResults[0]) => {
+        const p = w.data?.payload ?? '';
+        return /^A+$/.test(p) && (w.data?.confidence ?? 100) <= 50;
+      };
+      const hasValidLlm      = verifiedResults.some(w => w.type === 'LLM_VIDEO' && w.verification?.valid && !isNullPayload(w));
+      const hasValidForensic = verifiedResults.some(w => w.type === 'FORENSIC'  && w.verification?.valid && !isNullPayload(w));
+      const filteredResults = verifiedResults.filter(w => {
+        if ((w.type === 'FORENSIC' || w.type === 'LLM_VIDEO') && isNullPayload(w)) return false;
+        if (w.type === 'FORENSIC'  && !w.verification?.valid && hasValidLlm)      return false;
+        if (w.type === 'LLM_VIDEO' && !w.verification?.valid && hasValidForensic) return false;
+        return true;
+      });
+
+      if (filteredResults.length === 0) {
         setError("電子透かしを検出できませんでした。ファイルが改ざんされているか、透かしが含まれていません。");
       } else {
-        setResults(verifiedResults);
+        setResults(filteredResults);
       }
     } catch (err) {
       console.error(err);
@@ -413,7 +641,7 @@ function AnalyzerTab({ secretKey, options, fskOptions, secureIdLength }: { secre
   );
 }
 
-function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretKey: string, options: ForensicOptions, fskOptions: any, secureIdLength: number }) {
+function SignerTab({ secretKey, options, fskOptions, llmOptions, useLlmEmbed, setUseLlmEmbed, useLlmVideoEmbed, setUseLlmVideoEmbed, secureIdLength, payloadSymbols }: { secretKey: string, options: ForensicOptions, fskOptions: any, llmOptions: LlmVideoOptions, useLlmEmbed: boolean, setUseLlmEmbed: (v: boolean) => void, useLlmVideoEmbed: boolean, setUseLlmVideoEmbed: (v: boolean) => void, secureIdLength: number, payloadSymbols: number }) {
   const [userId, setUserId] = useState('user_12345');
   const [sessionId, setSessionId] = useState('sess_abcde');
   const [prizeId, setPrizeId] = useState('prize_001');
@@ -424,7 +652,6 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
   const [sourceMedia, setSourceMedia] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progressMsg, setProgressMsg] = useState<string>('');
-  const [isSilentVideo, setIsSilentVideo] = useState(false);
   
   const ffmpegRef = useRef(new FFmpeg());
 
@@ -450,7 +677,7 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
   };
 
   const handleGenerate = async () => {
-    const payloads = await generateWatermarkPayloads({ userId, sessionId, prizeId }, secretKey, secureIdLength);
+    const payloads = await generateWatermarkPayloads({ userId, sessionId, prizeId }, secretKey, secureIdLength, payloadSymbols);
     setSignedJson(payloads.jsonString);
     setSecurePayload(payloads.securePayload);
   };
@@ -477,34 +704,98 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
         const inputName = 'input_media' + sourceMedia.name.substring(sourceMedia.name.lastIndexOf('.'));
         await ffmpeg.writeFile(inputName, await fetchFile(sourceMedia));
         await ffmpeg.writeFile('fsk.wav', fskWavBuffer);
-        
-        // 3. Execute FFmpeg Command
-        setProgressMsg('動画・音声へ透かしを合成しています...(数分かかる場合があります)');
+
         const outputName = sourceMedia.type.startsWith('audio/') ? 'watermarked_output.wav' : 'watermarked_output.mp4';
-        
         let execCode = 0;
-        if (sourceMedia.type.startsWith('audio/')) {
-          // Audio only processing (mixing)
-          execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '[a]', outputName]);
+
+        // 3a. LLM DCT 動画フレーム透かし（動画のみ・オプション）
+        if (useLlmVideoEmbed && sourceMedia.type.startsWith('video/')) {
+          // FPS をログから検出
+          let detectedFps = 25;
+          const fpsListener = ({ message }: { message: string }) => {
+            const m = message.match(/(\d+(?:\.\d+)?)\s+fps/);
+            if (m) detectedFps = parseFloat(m[1]);
+          };
+          ffmpeg.on('log', fpsListener);
+          setProgressMsg('動画情報を解析中...');
+          await ffmpeg.exec(['-i', inputName]).catch(() => {});
+          ffmpeg.off('log', fpsListener);
+
+          // 全フレームを PNG 連番に展開
+          setProgressMsg('全フレームを展開中（長い動画は時間がかかります）...');
+          await ffmpeg.exec(['-i', inputName, '-vsync', '0', 'llm_%06d.png']);
+
+          // フレーム一覧を取得して LLM DCT 埋め込み
+          const allFiles = await ffmpeg.listDir('/');
+          const frameNames = allFiles
+            .filter((f: any) => !f.isDir && /^llm_\d+\.png$/.test(f.name))
+            .map((f: any) => f.name)
+            .sort();
+
+          let done = 0;
+          for (const fname of frameNames) {
+            done++;
+            if (done % 30 === 0 || done === frameNames.length) {
+              setProgressMsg(`LLM DCT 埋め込み中... ${done}/${frameNames.length} フレーム`);
+            }
+            const raw = await ffmpeg.readFile(fname) as Uint8Array;
+            const imageData = await pngBytesToImageData(raw);
+            embedLlmVideoFrame(imageData, securePayload, llmOptions);
+            const outBytes = await imageDataToPngBytes(imageData);
+            await ffmpeg.writeFile(fname, outBytes);
+          }
+
+          // フレーム連番 + FSK 音声で再エンコード（元動画に音声があればamix、なければトラック追加）
+          setProgressMsg('LLM DCT フレームを動画に再エンコード中...');
+          execCode = await ffmpeg.exec([
+            '-framerate', String(detectedFps), '-i', 'llm_%06d.png',
+            '-i', inputName, '-i', 'fsk.wav',
+            '-map', '0:v',
+            '-filter_complex', '[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=2[a]',
+            '-map', '[a]',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '192k', '-shortest',
+            outputName
+          ]);
+          // 元動画に音声がない場合のフォールバック（amixが失敗する）
+          if (execCode !== 0) {
+            try { await ffmpeg.deleteFile(outputName); } catch (_) {}
+            setProgressMsg('無音動画を検出 — FSK音声トラックを追加して再試行中...');
+            execCode = await ffmpeg.exec([
+              '-framerate', String(detectedFps), '-i', 'llm_%06d.png',
+              '-i', 'fsk.wav',
+              '-map', '0:v', '-map', '1:a',
+              '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+              '-c:a', 'aac', '-b:a', '192k', '-shortest',
+              outputName
+            ]);
+          }
         } else {
-          // Video processing
-          if (isSilentVideo) {
-            // Add as standard track
-            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', outputName]);
+          // 3b. 通常処理（FSK のみ）
+          setProgressMsg('動画・音声へ透かしを合成しています...(数分かかる場合があります)');
+          if (sourceMedia.type.startsWith('audio/')) {
+            execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '[a]', outputName]);
           } else {
-            // Mix with existing audio
+            // まず amix を試みる（元動画に音声あり）
             execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-filter_complex', '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', outputName]);
+            // 失敗した場合は無音動画と判断してトラック追加
+            if (execCode !== 0) {
+              try { await ffmpeg.deleteFile(outputName); } catch (_) {}
+              setProgressMsg('無音動画を検出 — FSK音声トラックを追加して再試行中...');
+              execCode = await ffmpeg.exec(['-i', inputName, '-i', 'fsk.wav', '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', outputName]);
+            }
           }
         }
-        
+
         if (execCode !== 0) {
-          throw new Error("FFmpegプロセスがエラーコードで終了しました。コンソールログを確認してください。無音動画の場合は「強制トラック追加」オプションをお試しください。");
+          throw new Error("FFmpegプロセスがエラーコードで終了しました。コンソールログを確認してください。");
         }
-        
+
         // 4. Download Result
         setProgressMsg('完了処理中...');
-        const data = await ffmpeg.readFile(outputName);
-        const finalBlob = new Blob([data], { type: sourceMedia.type.startsWith('audio/') ? 'audio/wav' : 'video/mp4' });
+        const rawData = await ffmpeg.readFile(outputName) as Uint8Array;
+        const data = new Uint8Array(rawData);
+        const finalBlob = new Blob([data.buffer as ArrayBuffer], { type: sourceMedia.type.startsWith('audio/') ? 'audio/wav' : 'video/mp4' });
         
         const url = URL.createObjectURL(finalBlob);
         const a = document.createElement('a');
@@ -534,8 +825,12 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
         ctx.drawImage(img, 0, 0);
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         
-        // 1. Embed Forensic Watermark (Secure Payload)
-        embedImageWatermarks(imageData, securePayload, options);
+        // 1. Embed watermark (Forensic DWT+DCT+SVD or LLM DCT)
+        if (useLlmEmbed) {
+          embedLlmImageWatermark(imageData, securePayload, llmOptions);
+        } else {
+          embedImageWatermarks(imageData, securePayload, options);
+        }
         ctx.putImageData(imageData, 0, 0);
         
         // Convert to Blob (PNG)
@@ -552,7 +847,7 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
         const finalBuffer = finalizeImageBuffer(new Uint8Array(buffer), signedJson);
 
         // Download
-        const finalBlob = new Blob([finalBuffer], { type: 'image/png' });
+        const finalBlob = new Blob([finalBuffer.buffer as ArrayBuffer], { type: 'image/png' });
         const url = URL.createObjectURL(finalBlob);
         const a = document.createElement('a');
         a.href = url;
@@ -623,24 +918,39 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
               onChange={(e) => setSourceMedia(e.target.files?.[0] || null)}
               className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
             />
+            <div className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-100 rounded-md">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={useLlmEmbed}
+                  onChange={(e) => setUseLlmEmbed(e.target.checked)}
+                  className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                />
+                <span className="text-xs text-gray-700 font-medium">【画像】LLM DCT透かしを使用（動画フレーム向け）</span>
+              </label>
+              <p className="text-[10px] text-gray-500 pl-6">
+                ONにすると高精度なLLM DCT埋め込みを使用します。OFFは従来のDWT+DCT+SVD透かしです。
+              </p>
+            </div>
+
             {sourceMedia && sourceMedia.type.startsWith('video/') && (
-              <div className="flex items-center pt-2">
-                <label className="flex items-center gap-2 cursor-pointer bg-gray-50 border border-gray-200 px-3 py-2 rounded-md w-full">
-                  <input 
+              <div className="flex flex-col gap-2 p-3 bg-indigo-50 border border-indigo-100 rounded-md">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
                     type="checkbox"
-                    checked={isSilentVideo}
-                    onChange={(e) => setIsSilentVideo(e.target.checked)}
-                    className="w-4 h-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                    checked={useLlmVideoEmbed}
+                    onChange={(e) => setUseLlmVideoEmbed(e.target.checked)}
+                    className="w-4 h-4 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500"
                   />
-                  <div className="flex flex-col">
-                    <span className="text-sm font-medium text-gray-700">無音動画への音声トラック追加を許可する</span>
-                    <span className="text-xs text-gray-500">元々音声がない動画に対して、FSK用の透かし音声トラックを強制的に追加します</span>
-                  </div>
+                  <span className="text-xs text-indigo-800 font-medium">【動画】全フレームに LLM DCT 透かしを埋め込む（低速）</span>
                 </label>
+                <p className="text-[10px] text-indigo-600 pl-6">
+                  全フレームを展開して DCT 透かしを埋め込み再エンコードします。FSK 音声透かしと同時に適用されます。フレーム数に比例して処理時間が増加します。
+                </p>
               </div>
             )}
-            
-            <button 
+
+            <button
               onClick={handleEmbed}
               disabled={!sourceMedia || !signedJson || isProcessing}
               className="w-full flex items-center justify-center gap-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-md transition-colors"
@@ -658,7 +968,7 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
               )}
             </button>
             <p className="text-xs text-gray-500 mt-2">
-              ※画像には「不可視画像透かし・EOF」、動画・音声には「FSK音声透かし」が埋め込まれます。動画処理はブラウザの性能により時間がかかります。
+              ※画像には「不可視画像透かし・EOF」、動画・音声には「FSK音声透かし」が埋め込まれます。LLM DCT ON時は加えて全フレームに映像透かしも埋め込まれます（大幅に時間増加）。
             </p>
           </div>
         </div>
@@ -687,15 +997,15 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
                       <div className="flex items-center gap-2">
                         <span className="w-4 h-4 rounded bg-blue-500 flex items-center justify-center text-[10px] text-white font-bold">1</span>
                         <span className="text-gray-300 text-xs flex-1">
-                          <span className="font-semibold text-blue-400 mr-2">セッションID ({securePayload.substring(0, 6).length}文字):</span> 
-                          <span className="bg-gray-800 px-2 py-0.5 rounded text-white">{securePayload.substring(0, 6)}</span>
+                          <span className="font-semibold text-blue-400 mr-2">セッションID ({secureIdLength}文字):</span>
+                          <span className="bg-gray-800 px-2 py-0.5 rounded text-white">{securePayload.substring(0, secureIdLength)}</span>
                         </span>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="w-4 h-4 rounded bg-purple-500 flex items-center justify-center text-[10px] text-white font-bold">2</span>
                         <span className="text-gray-300 text-xs flex-1">
-                          <span className="font-semibold text-purple-400 mr-2">HMAC署名 ({securePayload.substring(6).length}文字):</span> 
-                          <span className="bg-gray-800 px-2 py-0.5 rounded text-white">{securePayload.substring(6)}</span>
+                          <span className="font-semibold text-purple-400 mr-2">HMAC署名 ({payloadSymbols - secureIdLength}文字 / {(payloadSymbols - secureIdLength) * 6}ビット):</span>
+                          <span className="bg-gray-800 px-2 py-0.5 rounded text-white">{securePayload.substring(secureIdLength)}</span>
                         </span>
                       </div>
                     </div>
@@ -705,7 +1015,7 @@ function SignerTab({ secretKey, options, fskOptions, secureIdLength }: { secretK
                 )}
               </div>
               <p className="text-xs text-gray-500 mt-2">
-                ※高度フォレンジックは22バイトの文字数制限があるため、推測不能な 6文字の注文ID + 16文字の改ざん防止用署名 の組み合わせを採用しています。
+                ※{secureIdLength}文字のセッションID + {payloadSymbols - secureIdLength}文字のHMAC署名（{(payloadSymbols - secureIdLength) * 6}ビット強度）の組み合わせです。詳細設定で変更できます。
               </p>
             </div>
           </div>

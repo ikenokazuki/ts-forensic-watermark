@@ -1,6 +1,6 @@
 {
   "name": "ts-forensic-watermark",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Forensic watermarking library in TypeScript with Node.js helpers",
   "main": "dist/index.js",
   "browser": "dist/browser.js",

@@ -47,6 +47,7 @@ Embed robust and tamper-resistant watermarks into **images**, **videos**, and **
    - [8. MP4 UUID Box](#8-mp4-uuid-box)
    - [9. H.264 SEI User Data](#9-h264-sei-user-data)
    - [10. LLM DCT Frame Watermark](#10-llm-dct-frame-watermark)
+   - [11. Soft-decision (erasure) decoding & structured bit interleaving (v3.0.0+)](#11-soft-decision-erasure-decoding--structured-bit-interleaving-v300)
 9. [Operational Notes & Trade-offs](#operational-notes--trade-offs)
 10. [Architecture](#architecture)
 11. [Web UI Guide](#web-ui-guide)
@@ -68,8 +69,15 @@ All business logic (generation, signing, extraction, verification) is encapsulat
 | **[Image/Video]** LLM DCT frame watermark | Loeffler–Ligtenberg–Moschytz 8-point DCT + QIM | High (H.264/H.265 compression resistant) |
 | **[Audio/Video]** FSK acoustic watermark | Frequency-Shift Keying (14–16 kHz) + Goertzel | High (analog recording + AAC compression resistant) |
 | **[Shared]** Metadata signing | HMAC-SHA256 (Web Crypto API) | Tamper detection |
-| **[Shared]** Error correction | Reed-Solomon ECC (GF64) | Self-healing |
-| **[Shared]** Spatial scrambling | Arnold transform | Analysis resistance |
+| **[Shared]** Error correction | Reed-Solomon ECC (GF64) + **erasure decoding (v3.0.0+)** | Self-healing, up to 2× correction capacity |
+| **[Shared]** Spatial scrambling | Arnold transform + **structured bit interleaving (v3.0.0+)** | Analysis + burst-error resistance |
+
+### v3.0.0 — robustness update (breaking change)
+
+- **Soft-decision (erasure) decoding**: extraction declares low-confidence symbols as erasures based on `bitSums`, then decodes within the `2·errors + erasures ≤ eccLen` bound. **Up to 2× correction capacity** with the same ECC, so longer payloads (30–32 chars) become practical even under JPEG Q≈70.
+- **Structured bit interleaving**: a symbol's 6 bits are now placed at `b * 63 + s` (bit-plane major), so any two bits of the same symbol are at least 63 positions apart in the bit matrix. Combined with Arnold scrambling, this dramatically reduces the probability of a single JPEG block wiping out all bits of one symbol.
+- **Compatibility**: watermarks created with v2.x cannot be extracted with v3.x (bit layout changed). Pin v2.x if you need to read legacy watermarks.
+- **Zero perceptual change**: all of the above are encoder/decoder-layer changes; embedding strength (`delta`), targeted blocks, and SVD operation are identical to v2.x.
 
 ---
 
@@ -1145,6 +1153,10 @@ if (extracted) console.log(JSON.parse(extracted).userId);
 | `arnoldIterations` | number | `7` | **Arnold transform iterations.** Controls the spatial scrambling depth. **Must be identical at embedding and extraction** — any mismatch causes complete extraction failure. |
 | `force` | boolean | `false` | When `true`, skips variance and SVD threshold checks to force-embed in every block. Used for tests and video pattern generation. |
 | `robustAngles` | number[] | `[0]` | Angles to try during extraction via `analyzeImageWatermarks`. More angles = higher rotation robustness but slower. |
+| `payloadSymbols` | number | `22` | **Number of data symbols.** Controls the payload / ECC split (ECC = 63 − payloadSymbols). Must match between embedding and extraction. |
+| `softDecoding` | boolean | `true` | **Soft-decision (erasure) decoding** (v3.0.0+). Low-confidence symbol positions are declared erasures, expanding RS correction capacity to `2·errors + erasures ≤ eccLen` — up to **2× the hard-decision limit**. Greatly improves robustness under JPEG and other lossy paths. Set `false` to fall back to pure hard-decision decoding. |
+| `erasureThreshold` | number | `0.35` | **Relative erasure threshold** (only when `softDecoding: true`). A symbol is erased when its minimum bit confidence drops below `(median over all symbols) × threshold`. Higher values erase more symbols (rescue weaker bits at the cost of ECC budget); lower values approach hard decoding. |
+| `regions` | number | `1` | **Spatial diversity (multi-region embedding).** Divides the image into N regions and embeds the same watermark into each. Extraction soft-combines (Maximal-Ratio Combining) the per-region soft values before RS decoding. Improves robustness against partial crops and locally-uneven degradation. Each region requires at least **160×160 px**; if the image is too small, automatically falls back to the largest N that fits (down to `1`). Must match between embedding and extraction. See [Spatial diversity](#spatial-diversity-regions) for details. |
 
 ### LlmVideoOptions (LLM DCT frame watermark settings)
 
@@ -1249,32 +1261,37 @@ The transform is periodic (period 30 for N=20) and invertible. Scrambling conver
 
 #### Overview
 
-The algebraic error-correcting code used in barcodes, QR codes, and CDs. Operates over the Galois field GF(2⁸).
+The algebraic error-correcting code used in barcodes, QR codes, and CDs. This library uses **Reed-Solomon over GF(2⁶) = GF(64)** (`ReedSolomonGF64`).
 
-**Forensic watermark configuration:**
-- Input: 22 bytes (payload)
-- ECC: 26 bytes
-- Output: 48 bytes (384 bits)
-- Correction capacity: up to **13 bytes** of corruption (~54% of codeword)
+**Why GF(64)?** Watermark payloads are Base64url strings (`A-Z, a-z, 0-9, -, _`, 64 characters). GF(64) makes 1 symbol exactly equal to 1 Base64url character (6 bits), so symbol boundaries align perfectly with payload boundaries — no padding loss as you would get with GF(2⁸) = 8-bit symbols.
 
-**FSK watermark configuration:**
-- Input: 22 bytes (payload)
-- ECC: 8 bytes
-- Output: 30 bytes (240 bits)
-- Correction capacity: up to **4 bytes** of corruption
+**Forensic watermark configuration (default):**
+- Data symbols: 22 (= 22 chars Base64url)
+- ECC symbols: 41
+- Codeword length: 63 symbols (the GF(64) maximum, = 378 bits)
+- Hard-decision correction: up to 20 symbol errors
+- Soft-decision correction (v3.0.0+): up to 41 symbol erasures (`2·errors + erasures ≤ 41`)
+
+**FSK watermark configuration (default):**
+- Data symbols: 22
+- ECC symbols: 18
+- Codeword length: 40 symbols (FSK uses a fixed 40-symbol codeword)
+- Hard-decision correction: up to 9 symbol errors
 
 #### How it works
 
-The BCH Berlekamp-Massey algorithm computes the error-locator polynomial from syndrome polynomials; Forney's formula recovers the error values. The entire implementation (`ReedSolomon` class in `forensic.ts`) is dependency-free and runs in both the browser and Node.js.
+The Berlekamp-Massey algorithm computes the error-locator polynomial from syndrome polynomials; Chien search finds error positions; Forney's formula recovers the error values. The entire implementation (`watermark-lib/src/rs-gf64.ts`) is dependency-free and runs in both the browser and Node.js.
+
+**Errors-and-erasures decoder (v3.0.0+):** the soft `bitSums` values from the extraction stage identify low-confidence symbol positions, which are declared as erasures before decoding. By the RS theoretical bound `2 × errors + erasures ≤ eccLen`, pure-erasure decoding gives **twice** the correction capacity of hard-decision decoding.
 
 **Strengths:**
-- Handles burst errors (consecutive corrupted bytes)
+- Handles burst errors (consecutive corrupted symbols) — further improved by structured interleaving (v3.0.0+)
 - Handles random scattered errors
-- Erasure errors (known positions) can correct twice as many bytes
+- Soft-decision (erasure) decoding (v3.0.0+) — directly corrects the bit-confidence loss caused by JPEG and other lossy paths
 
 **Weaknesses:**
-- Returns `null` when the error count exceeds capacity (uncorrectable)
-- Uniform signal degradation (e.g. extreme JPEG) may exceed capacity
+- Returns `null` when errors exceed the capacity bound (uncorrectable)
+- Cannot help when degradation destroys the 16-bit synchronization marker entirely
 
 ---
 
@@ -1603,6 +1620,132 @@ A linear binary search for the 16-byte UUID `086f3693b7b34f2c965321492feee5b8` s
 
 ---
 
+### 11. Soft-decision (erasure) decoding & structured bit interleaving (v3.0.0+)
+
+Two encoding-layer improvements introduced in v3.0.0. **The image embedding (delta, target blocks, SVD operation) is identical to v2.x — zero perceptual change** — yet JPEG robustness is significantly improved.
+
+#### 11.1 Soft-decision (erasure) decoding
+
+##### Overview
+
+In v2.x, extraction collapsed each `bitSums[i]` value to a hard 0/1 (`> 0 ? 1 : 0`) before handing it to the RS decoder. This discarded the precious **confidence** information carried by `|bitSums[i]|`.
+
+In v3.0.0, low-confidence symbol positions are declared as **erasures** before invoking an errors-and-erasures decoder. Erasures are far cheaper than errors in the RS bound:
+
+| Mode | Correctable bound | At ECC=41 |
+| :--- | :--- | :--- |
+| Hard-decision (v2.x) | `2 × errors ≤ eccLen` → `errors ≤ ⌊eccLen/2⌋` | **20 symbols** |
+| Erasures only | `erasures ≤ eccLen` | **41 symbols** |
+| Mixed (v3.0.0+) | `2 × errors + erasures ≤ eccLen` | e.g. 5 errors + 31 erasures |
+
+##### Algorithm sketch (`ReedSolomonGF64.decodeWithErasures`)
+
+```
+Input: received word r, erasure positions E = {e_0, ..., e_{ν-1}}
+
+1. Compute syndromes:
+     S_i = r(α^i),  i = 0, ..., d-1   (d = eccLen)
+
+2. Erasure locator polynomial σ_e(x):
+     σ_e(x) = ∏_{e∈E} (1 + α^{n-1-e} · x)
+
+3. Forney syndromes T(x) = σ_e(x) · S(x) mod x^d:
+     T_j = Σ σ_e[i] · S_{j-i}
+
+4. Run Berlekamp-Massey on T[ν..d-1]
+     → error locator σ_E(x)
+
+5. Combined locator σ(x) = σ_e(x) · σ_E(x)
+
+6. Chien search → find all error/erasure positions
+
+7. Forney's formula → compute magnitudes; XOR into r
+```
+
+##### Erasure decision threshold
+
+The extracted `bitSums` array lives in Arnold-scrambled space. `inverseArnoldFloat()` maps it back to logical positions, where per-symbol confidence is computed:
+
+```
+confidence(s) = min_{b ∈ [0, 5]} |unscrambledSoft[bitPosition(s, b)]|
+
+m = median(confidence over all symbols)
+mark s as erasure if confidence(s) < m × erasureThreshold
+
+if more than eccLen erasures, keep the lowest-confidence eccLen
+```
+
+The default `erasureThreshold = 0.35` is a practical sweet spot for typical JPEG (Q=50–80): aggressive enough to rescue hard-decode failures, conservative enough to avoid over-erasing. The median-based scaling makes the threshold robust to per-image confidence-magnitude variation.
+
+##### Notes
+
+- If erasure decisions were perfect, soft decoding would deliver the full 2× theoretical gain. Real-world errors in the threshold call (correct bits flagged as erasures) reduce the effective gain to roughly 1.3–1.7×
+- Under high-SNR conditions (light JPEG, PNG) virtually no erasures are flagged, so soft decoding degenerates to hard decoding — backward compatible
+- Whenever hard decoding succeeds, soft decoding produces the same answer
+
+#### 11.2 Structured bit interleaving
+
+##### Overview
+
+In v2.x, "bit `b` of symbol `s`" was placed at `MARKER.length + s × 6 + b` — bits of one symbol sat side-by-side. After Arnold scrambling, there was still a non-trivial probability that two bits of the same symbol landed in spatially-close 8×8 blocks.
+
+In v3.0.0, layout switches to **bit-plane major**:
+
+```
+v2.x:    position = MARKER + s × 6 + b   (symbol-major; 6 bits adjacent)
+v3.0.0+: position = MARKER + b × 63 + s   (bit-plane major; 6 bits at least 63 apart)
+```
+
+##### Effects
+
+- Any two bits of the same symbol are at least **63 positions apart** (≈75% of the maximum possible distance) before Arnold even runs
+- Combined with Arnold scrambling, it becomes far less likely for a single localized JPEG block to wipe out multiple bits of one symbol
+- Helps both hard and soft decoding — particularly valuable against burst errors
+
+##### Implementation
+
+```typescript
+// Single function used in both directions
+function bitPosition(symbolIdx: number, bitIdx: number): number {
+  return MARKER.length + bitIdx * CODEWORD_SYMBOLS + symbolIdx;
+}
+
+// Embed (embedForensic)
+for (let s = 0; s < encodedSymbols.length; s++) {
+  for (let b = 0; b < BITS_PER_SYM; b++) {
+    bitMatrix[bitPosition(s, b)] = (encodedSymbols[s] >> (BITS_PER_SYM - 1 - b)) & 1;
+  }
+}
+
+// Extract (extractForensic) — same index calculation
+for (let s = 0; s < extractedSymbols.length; s++) {
+  let sym = 0;
+  for (let b = 0; b < BITS_PER_SYM; b++) {
+    sym = (sym << 1) | extractedBits[bitPosition(s, b)];
+  }
+  extractedSymbols[s] = sym & 0x3F;
+}
+```
+
+##### Cost
+
+Loop reordering only; identical memory and CPU. Arnold/inverse-Arnold operations also run the same number of times.
+
+#### 11.3 Compatibility with v2.x
+
+Watermarks created with v3.0.0 cannot be extracted by v2.x extractors and vice versa:
+
+| Embed version | Extract version | Result |
+| :---: | :---: | :--- |
+| v2.x | v2.x | OK |
+| v2.x | v3.0.0 | **fails** (bit layout mismatch) |
+| v3.0.0 | v2.x | **fails** (bit layout mismatch) |
+| v3.0.0 | v3.0.0 | OK |
+
+To read legacy watermarks, pin v2.x.
+
+---
+
 ## Operational Notes & Trade-offs
 
 ### Why 22 bytes?
@@ -1622,14 +1765,130 @@ The 22-byte design maximises ECC length (= robustness) while preserving enough i
 
 ### `secureIdLength` trade-off
 
-| secureIdLength | ID length | HMAC length | Recommended use |
-| :---: | :---: | :---: | :--- |
-| 4 | 4 bytes | 18 bytes | Security-first (short ID, long HMAC) |
-| **6 (default)** | **6 bytes** | **16 bytes** | **Balanced** |
-| 8 | 8 bytes | 14 bytes | Longer IDs required |
-| 12 | 12 bytes | 10 bytes | Not recommended (HMAC too short) |
+HMAC strength formula: `HMAC strength = (payloadSymbols - secureIdLength) × 6 bits`
+
+The table below assumes **payloadSymbols=22 (default)**. See [Three-parameter co-design](#three-parameter-co-design-regions--payloadsymbols--secureidlength) for how `payloadSymbols` and `regions` change the picture.
+
+| secureIdLength | ID chars | HMAC chars | HMAC strength | Assessment |
+| :---: | :---: | :---: | :---: | :--- |
+| 4 | 4 | 18 | **108 bits** | Security-first (short ID, long HMAC) |
+| **6 (default)** | **6** | **16** | **96 bits** | **Balanced — recommended** |
+| 8 | 8 | 14 | 84 bits | Longest ID while still above MAC baseline |
+| 10 | 10 | 12 | 72 bits | Above NIST MAC truncation baseline (64 bits), margin tight |
+| 12 | 12 | 10 | 60 bits | **Not recommended**: below NIST MAC baseline, ~36 days to break at 10¹² ops/s |
+| ≥14 | ≥14 | ≤8 | ≤48 bits | **Dangerous**: breakable by a single GPU in minutes to days |
+
+**Why the default `secureIdLength=6` should not be changed casually:**
+
+- **96-bit strength** is 1.5× the NIST SP 800-107r1 MAC truncation baseline (64 bits)
+- ID space: 64^6 ≈ 68.7 billion — plenty for session-ID use
+- Forgery cost: 2^96 ≈ 7.9 × 10²⁸ attempts. At 10¹² ops/s that takes about **2.5 billion years** (~1/5 of the age of the universe)
 
 > **Important:** `secureIdLength` must be identical during embedding and verification — any mismatch causes verification to always fail.
+
+### Three-parameter co-design (`regions` × `payloadSymbols` × `secureIdLength`)
+
+When you need longer IDs without sacrificing HMAC strength, tune these three parameters together:
+
+```
+HMAC strength      = (payloadSymbols - secureIdLength) × 6 bits
+ID length          = secureIdLength
+ECC symbols        = (63 - payloadSymbols)
+
+Effective correction (v3.0.0+):
+  hard:   floor(eccLen / 2)        (only when softDecoding: false)
+  soft:   up to eccLen              (default — `2·errors + erasures ≤ eccLen`)
+
+Effective robustness = correction
+                     + spatial-diversity gain from regions
+                     + burst-error gain from structured interleaving (v3.0.0+, automatic)
+```
+
+#### What changes in v3.0.0
+
+In v2.x, ECC=41 capped at "20 symbols correctable". With v3.0.0 soft decoding the same ECC=41 corrects **up to 41 symbol erasures** (in practice 25–35, since erasure decisions from soft thresholds are imperfect).
+
+This expands the design space:
+
+- **Same robustness, longer ID** — pushing `payloadSymbols` from 22 to 32 retains JPEG resilience equivalent to v2.x's `payloadSymbols=22`
+- **Same ID, more robust** — keeping `payloadSymbols` constant boosts decode success on heavily-compressed JPEGs that v2.x would fail on
+- **Increase `payloadSymbols` before increasing `regions`** — you can now lengthen IDs with `regions=1` (no image splitting required)
+
+#### Design patterns (v3.0.0+)
+
+| Use case | regions | payloadSymbols | secureIdLength | HMAC | ID | ECC | Correction (hard / soft) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Default** | 1 | 22 | 6 | 96 bits | 6 chars | 41 | 20 / **41** |
+| 10-char ID (v3 recommended) | 1 | **32** | 10 | **132 bits** | **10 chars** | 31 | 15 / **31** |
+| Longer ID + stronger HMAC (v2 compat) | 3 | 30 | 10 | 120 bits | 10 chars | 33 | 16 / **33** |
+| Max ID length, HMAC preserved | 3 | 32 | 12 | **120 bits** | **12 chars** | 31 | 15 / **31** |
+| Extreme robustness (short ID) | 4 | 15 | 4 | 66 bits | 4 chars | 48 | 24 / **48** |
+| Maximum information density | 4 | 40 | 14 | 156 bits | **14 chars** | 23 | 11 / **23** |
+| **ID-priority (v3 new)** | 1 | **40** | **16** | **144 bits** | **16 chars** | 23 | 11 / **23** |
+
+> **"ID-priority (v3 new)" pattern:** with v3.0.0 soft decoding, you can deliver a 16-char ID + 144-bit HMAC even with `regions=1`. ECC of 23 symbols still rescues up to 23 erasures, which keeps the JPEG-Q≈70 regime in scope. Validated by the `payloadSymbols=32 @ Q=70` test.
+
+#### Example: 10-char ID with stronger HMAC (v3.0.0 pattern)
+
+```typescript
+const options = {
+  payloadSymbols: 32,   // unsafe in v2.x — practical with v3.0.0 soft decoding
+  // softDecoding: true (default)
+};
+const payload = await generateSecurePayload(sessionId, secret, 10, 32); // secureIdLength=10, payloadLength=32
+
+const watermarked = await embedForensicImage(buffer, payload, options);
+const result = await extractForensicImage(watermarked, options);
+const valid = await verifySecurePayload(result.payload, secret, 10, 32);
+```
+
+#### Example: maximum robustness via stacked techniques
+
+```typescript
+// Spatial diversity × soft decoding × structured interleaving (all stacked)
+const options = {
+  regions: 3,           // robust to partial crops & uneven degradation
+  payloadSymbols: 32,   // 32-char ID
+  // softDecoding: true (default)
+};
+```
+
+#### Caveats
+
+- The ECC-reduction benefit from `regions > 1` is strongest against **spatially-uneven** degradation. Under perfectly uniform noise the existing modulo-based redundancy already covers most of the gain, so the actual number of ECC symbols you can safely drop is **image and distortion dependent**
+- Soft-decoding effective correction sits below the theoretical `eccLen` because some "actually correct" bits get falsely flagged as erasures by the threshold heuristic. The default `erasureThreshold` of `0.35` is tuned for typical JPEG damage; under harsher conditions raising it to `0.4–0.5` can rescue more
+- For very-high-redundancy regimes (`payloadSymbols ≤ 10`), the existing hard-decision capacity is already abundant and soft decoding adds little. The benefits show up most clearly in the `payloadSymbols ≥ 30` regime
+- The three core parameters (`regions` / `payloadSymbols` / `secureIdLength`) **must match** between embedding and extraction. `softDecoding` / `erasureThreshold` are extraction-side only and need not match
+
+### Spatial diversity (`regions`)
+
+The `regions` option on `ForensicOptions` splits the image into N regions and embeds the same watermark into each. Extraction independently derives per-region soft values from each region and combines them via **Maximal-Ratio Combining** before Reed-Solomon decoding. This classic diversity technique delivers three benefits:
+
+- **Partial-crop resilience**: if one region is cropped off, the others still decode
+- **Uneven-degradation averaging**: a heavily damaged region is down-weighted implicitly by soft combining
+- **Spatially-biased noise robustness**: decorrelates noise that happens to align with specific scrambled bit positions in the single-region layout
+
+#### Usage
+
+```typescript
+const watermarked = await embedForensicImage(buffer, payload, { regions: 3 });
+const result      = await extractForensicImage(watermarked, { regions: 3 });
+```
+
+#### Constraints and fallback
+
+- Each region needs at least **160×160 px** (enough for a 20×20 grid of 8-px blocks)
+- If the requested `regions` does not fit, the library **automatically falls back to the largest feasible N** (down to `1`) and emits a `console.warn`
+- Both embed and extract compute the same fallback deterministically from image width/height, so they stay in sync as long as the image size does not change between embedding and extraction
+
+| Image size | regions=2 | regions=4 | regions=9 |
+| :---: | :---: | :---: | :---: |
+| 256×256 | falls back to 1 | falls back to 1 | falls back to 1 |
+| 320×320 | OK (2×1) | OK (2×2) | falls back to 4 |
+| 512×512 | OK | OK (2×2) | falls back to 4 |
+| 1080×1080 | OK | OK | OK (3×3) |
+
+> **Important:** `regions` must match between embedding and extraction. If the image is significantly resized between the two, the fallback may diverge and extraction will fail.
 
 ### Recommended embedding strategies
 
@@ -1701,6 +1960,38 @@ graph TD
 ## Web UI Guide
 
 The included React browser UI lets you embed and verify watermarks without writing any code.
+
+### Architecture
+
+- **Entrypoint:** `src/main.tsx` → `src/App.tsx`
+- **UI stack:** React + Vite + Tailwind CSS
+- **Video processing:** WebAssembly FFmpeg (`@ffmpeg/ffmpeg`) — runs entirely in-browser
+- **Library import:** via relative path `../watermark-lib/src/browser` (Node.js-only APIs are excluded automatically)
+- **State management:** plain React `useState` for `forensicOptions`, `fskOptions`, `llmOptions`, `secureIdLength`, `payloadSymbols`
+
+The UI is intentionally a **thin wrapper** that builds `forensicOptions` and forwards them to library functions (`embedForensicImage` etc.). Library default-value changes therefore flow through to the UI automatically.
+
+### v3.0.0 behavior in the UI
+
+The UI **inherits the v3.0.0 robustness improvements without any code change**:
+
+- **Soft decoding (`softDecoding: true`)**: enabled by default in the library. The Analyze tab gets a higher detection rate on JPEG-compressed inputs out of the box
+- **Structured interleaving**: applied automatically on both embed and extract. Behavior visible from the UI is unchanged, but the underlying bit layout is incompatible with v2.x watermarks
+- **`payloadSymbols` upper bound**: the UI's selector exposes `[10, 15, 22, 30, 40]`. With v3.0.0 soft decoding, `30` graduates from "long-ID variant" to "practical default for longer IDs". `40` is still discouraged but is more realistic than under v2.x
+- **`erasureThreshold` override**: not surfaced in the UI. Direct callers of `extractForensicImage` may pass it (default `0.35`); the default is good enough for most cases
+
+> **Compatibility note:** v2.x watermarks cannot be read by v3.0.0 extractors. Pin `package.json` to `2.x` (or run a v2 CLI alongside) if you need to read legacy watermarks.
+
+### Dev server
+
+From the repo root:
+
+```bash
+npm install
+npm run dev
+```
+
+Source changes inside `watermark-lib/` reflect into the UI immediately because `src/App.tsx` imports it via the relative path `../watermark-lib/src/browser` rather than a published package.
 
 ### Shared settings bar
 

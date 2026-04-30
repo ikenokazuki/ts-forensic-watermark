@@ -206,6 +206,122 @@ export class ReedSolomonGF64 {
   }
 
   /**
+   * Errors-and-erasures decoder.
+   *
+   * Erasures are symbol positions known to be unreliable (provided by the caller
+   * from soft-decision information, e.g. low-confidence DCT/SVD bits in the
+   * watermark extraction pipeline). The bound is `2 * errors + erasures ≤ eccLen`,
+   * which means up to `eccLen` erasures can be corrected when there are no
+   * unsignalled errors — twice the capacity of pure error correction.
+   *
+   * Returns the original data symbols on success, or null when decoding fails.
+   * Calling with `erasurePos = []` is equivalent to `decode()`.
+   */
+  public decodeWithErasures(msg: Uint8Array, erasurePos: number[] = []): Uint8Array | null {
+    const n = msg.length;
+    if (n > GF_MAX) return null;
+    const v = erasurePos.length;
+    if (v > this.eccLen) return null;
+    for (const p of erasurePos) {
+      if (p < 0 || p >= n) return null;
+    }
+
+    // Step 1: syndromes (small-endian: synd[i] = msg evaluated at α^i)
+    const synd = new Uint8Array(this.eccLen);
+    let hasErr = false;
+    for (let i = 0; i < this.eccLen; i++) {
+      synd[i] = this.polyEval(msg, this.exp[i]);
+      if (synd[i] !== 0) hasErr = true;
+    }
+    if (!hasErr && v === 0) return msg.subarray(0, n - this.eccLen);
+
+    // Step 2: erasure locator polynomial σ_e(x) = ∏(1 + α^{n-1-p} · x)
+    // Built in big-endian to match the rest of the codebase.
+    let sigma_e: Uint8Array = new Uint8Array([1]);
+    for (const p of erasurePos) {
+      const e = (n - 1 - p) % GF_MAX;
+      // (α^e · x + 1) in big-endian = [α^e, 1]
+      sigma_e = this.polyMul(sigma_e, new Uint8Array([this.exp[e], 1]));
+    }
+
+    // Step 3: Forney syndromes T(x) = σ_e(x) · S(x) mod x^eccLen.
+    // Both σ_e and S are treated as small-endian here; convert σ_e accordingly.
+    const sigma_e_se_len = sigma_e.length; // = v + 1
+    const sigma_e_se = new Uint8Array(sigma_e_se_len);
+    for (let i = 0; i < sigma_e_se_len; i++) {
+      sigma_e_se[i] = sigma_e[sigma_e_se_len - 1 - i];
+    }
+    const T = new Uint8Array(this.eccLen);
+    for (let i = 0; i < this.eccLen; i++) {
+      let s = 0;
+      const jMax = Math.min(i, sigma_e_se_len - 1);
+      for (let j = 0; j <= jMax; j++) {
+        s ^= this.mul(sigma_e_se[j], synd[i - j]);
+      }
+      T[i] = s;
+    }
+
+    // Step 4: Berlekamp-Massey on the last (eccLen - v) Forney syndromes.
+    // The first v Forney syndromes are "consumed" by the erasures.
+    const numEffective = this.eccLen - v;
+    let C = new Uint8Array([1]), B = new Uint8Array([1]), L = 0, m = 1, b = 1;
+    for (let i = 0; i < numEffective; i++) {
+      let d = T[v + i];
+      for (let j = 1; j <= L; j++) {
+        const idx = v + i - j;
+        if (idx >= 0) d ^= this.mul(C[C.length - 1 - j], T[idx]);
+      }
+      if (d === 0) {
+        m++;
+      } else {
+        const Bs = new Uint8Array(B.length + m);
+        Bs.set(B);
+        const scale = this.mul(d, this.div(1, b));
+        const Tnew = this.polyAdd(C, scale === 0 ? new Uint8Array(0) : this.polyScale(Bs, scale));
+        if (2 * L <= i) { L = i + 1 - L; B = C; b = d; m = 1; } else m++;
+        C = Tnew as Uint8Array<ArrayBuffer>;
+      }
+    }
+
+    // Step 5: combined locator σ(x) = σ_e(x) · σ_E(x)
+    const sigma = this.polyMul(sigma_e, C);
+
+    // Step 6: Chien search for roots of σ
+    const allErrPos: number[] = [];
+    for (let i = 0; i < GF_MAX; i++) {
+      if (this.polyEval(sigma, this.exp[i]) === 0) {
+        allErrPos.push((GF_MAX - i) % GF_MAX);
+      }
+    }
+    const expectedRoots = L + v;
+    if (allErrPos.length !== expectedRoots) return null;
+
+    // Step 7: Forney algorithm for error/erasure magnitudes.
+    // Mirrors the existing decode(): omega(x) = (S · σ) mod x^eccLen, formal derivative for σ'.
+    const syndR = new Uint8Array(synd).reverse();
+    const omega = this.polyMul(syndR, sigma).subarray(sigma.length - 1);
+    const sigmaD = new Uint8Array(Math.max(1, sigma.length - 1));
+    for (let i = 0; i < sigma.length - 1; i += 2) {
+      sigmaD[sigmaD.length - 1 - i] = sigma[sigma.length - 2 - i];
+    }
+
+    const corrected = new Uint8Array(msg);
+    for (let i = 0; i < allErrPos.length; i++) {
+      const errPos_i = allErrPos[i];
+      const rootInv = this.exp[errPos_i === 0 ? 0 : GF_MAX - errPos_i];
+      const pos = corrected.length - 1 - errPos_i;
+      if (pos < 0 || pos >= corrected.length) return null;
+      const Xk = this.exp[errPos_i];
+      const denom = this.polyEval(sigmaD, rootInv);
+      if (denom === 0) return null;
+      const magnitude = this.mul(this.polyEval(omega, rootInv), this.div(1, denom));
+      corrected[pos] ^= this.mul(Xk, magnitude);
+    }
+
+    return corrected.subarray(0, corrected.length - this.eccLen);
+  }
+
+  /**
    * Encode a Base64url string.
    * Returns a longer Base64url string with ECC characters appended.
    *
@@ -223,6 +339,14 @@ export class ReedSolomonGF64 {
    */
   public decodeString(data: string): string | null {
     const decoded = this.decode(base64urlToSymbols(data));
+    return decoded !== null ? symbolsToBase64url(decoded) : null;
+  }
+
+  /**
+   * Errors-and-erasures variant of decodeString. See decodeWithErasures.
+   */
+  public decodeStringWithErasures(data: string, erasurePos: number[] = []): string | null {
+    const decoded = this.decodeWithErasures(base64urlToSymbols(data), erasurePos);
     return decoded !== null ? symbolsToBase64url(decoded) : null;
   }
 }

@@ -103,6 +103,7 @@ export default function App() {
     varianceThreshold: 25,
     arnoldIterations: 7,
     force: false,
+    regions: 1,
     robustAngles: [0, 90, 180, 270, 0.5, -0.5, 1, -1, 2, -2, 3, -3]
   });
   const [fskOptions, setFskOptions] = useState({
@@ -279,6 +280,23 @@ export default function App() {
                       className="w-full"
                     />
                     <p className="text-xs text-gray-500">空間スプレッドの反復回数です。(推奨: 7)</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm justify-between flex mb-1">
+                      <span className="font-medium text-gray-700">Regions (空間ダイバーシティ)</span>
+                      <span className="text-gray-500">{forensicOptions.regions ?? 1}</span>
+                    </label>
+                    <input
+                      type="range" min="1" max="9" step="1"
+                      value={forensicOptions.regions ?? 1}
+                      onChange={(e) => setForensicOptions({ ...forensicOptions, regions: Number(e.target.value) })}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">
+                      画像を N 領域に分割し同じ透かしを埋め込みます。部分クロップや局所劣化への耐性が向上します。
+                      各領域に最低 160x160 px 必要。画像が小さい場合は自動で縮退。<span className="text-amber-600 font-medium">埋め込みと抽出で同じ値を使用してください。</span>(推奨: 1〜3)
+                    </p>
                   </div>
 
                   <div className="flex flex-col gap-3 pt-6">

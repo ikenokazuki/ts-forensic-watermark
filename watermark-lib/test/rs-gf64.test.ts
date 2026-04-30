@@ -156,4 +156,99 @@ describe('ReedSolomonGF64', () => {
       expect(decoded === null || decoded === payload).toBe(true);
     });
   });
+
+  describe('decodeWithErasures (errors-and-erasures decoder)', () => {
+    it('with empty erasure list, behaves identically to decode()', () => {
+      const rs = new ReedSolomonGF64(8);
+      const data = new Uint8Array([5, 10, 15, 20, 25, 30, 35, 40]);
+      const encoded = rs.encode(data);
+
+      const corrupted = new Uint8Array(encoded);
+      corrupted[0] ^= 0x01;
+      corrupted[3] ^= 0x07;
+      corrupted[6] ^= 0x15;
+      corrupted[9] ^= 0x3f;
+
+      const a = rs.decode(corrupted);
+      const b = rs.decodeWithErasures(corrupted, []);
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      expect(Array.from(a!)).toEqual(Array.from(b!));
+    });
+
+    it('corrects up to eccLen erasures (twice the hard-decision capacity)', () => {
+      // RS(13, 5) over GF(64): eccLen=8, hard-decision t=4, erasure capacity=8.
+      const rs = new ReedSolomonGF64(8);
+      const data = new Uint8Array([1, 2, 3, 4, 5]);
+      const encoded = rs.encode(data); // length 13
+
+      // Corrupt 8 symbols (well beyond hard-decision t=4) but provide all positions as erasures.
+      const corrupted = new Uint8Array(encoded);
+      const erasures = [0, 2, 4, 6, 8, 10, 11, 12];
+      for (const p of erasures) corrupted[p] ^= 0x2a;
+
+      // Hard decode must fail (8 errors > t=4)
+      expect(rs.decode(corrupted)).toBeNull();
+
+      // Erasure decode must succeed
+      const decoded = rs.decodeWithErasures(corrupted, erasures);
+      expect(decoded).not.toBeNull();
+      expect(Array.from(decoded!)).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    it('corrects mixed errors + erasures within 2*errors + erasures ≤ eccLen', () => {
+      // eccLen=10, allowed: 1 error + up to 8 erasures (2+8=10), or 2 errors + up to 6 erasures.
+      const rs = new ReedSolomonGF64(10);
+      const data = new Uint8Array([7, 14, 21, 28, 35]);
+      const encoded = rs.encode(data); // length 15
+
+      const corrupted = new Uint8Array(encoded);
+      // 6 erasures (positions known) + 2 unsignalled errors (positions hidden from decoder)
+      const erasures = [0, 3, 6, 9, 12, 14];
+      for (const p of erasures) corrupted[p] ^= 0x2a;
+      corrupted[1] ^= 0x05; // unsignalled error
+      corrupted[7] ^= 0x33; // unsignalled error
+
+      const decoded = rs.decodeWithErasures(corrupted, erasures);
+      expect(decoded).not.toBeNull();
+      expect(Array.from(decoded!)).toEqual([7, 14, 21, 28, 35]);
+    });
+
+    it('returns null when erasures + 2*errors exceeds eccLen', () => {
+      const rs = new ReedSolomonGF64(8); // eccLen=8
+      const data = new Uint8Array([1, 2, 3, 4, 5]);
+      const encoded = rs.encode(data);
+
+      // 4 erasures + 3 errors → 4 + 6 = 10 > 8 (uncorrectable)
+      const corrupted = new Uint8Array(encoded);
+      const erasures = [0, 4, 8, 12];
+      for (const p of erasures) corrupted[p] ^= 0x2a;
+      corrupted[1] ^= 0x01;
+      corrupted[5] ^= 0x02;
+      corrupted[9] ^= 0x04;
+
+      expect(rs.decodeWithErasures(corrupted, erasures)).toBeNull();
+    });
+
+    it('rejects erasure positions out of range', () => {
+      const rs = new ReedSolomonGF64(4);
+      const encoded = rs.encode(new Uint8Array([1, 2, 3]));
+      expect(rs.decodeWithErasures(encoded, [-1])).toBeNull();
+      expect(rs.decodeWithErasures(encoded, [encoded.length])).toBeNull();
+    });
+
+    it('decodeStringWithErasures wraps decodeWithErasures correctly', () => {
+      const rs = new ReedSolomonGF64(8);
+      const payload = 'TX9901SGVsbG8hV29ybGQ-';
+      const encoded = rs.encodeString(payload);
+      const arr = base64urlToSymbols(encoded);
+
+      // 6 erasures (way beyond hard-decision t=4)
+      const erasures = [1, 5, 9, 13, 17, 21];
+      for (const p of erasures) arr[p] = (arr[p] ^ 0x3f) & 0x3f;
+
+      const decoded = rs.decodeStringWithErasures(symbolsToBase64url(arr), erasures);
+      expect(decoded).toBe(payload);
+    });
+  });
 });
